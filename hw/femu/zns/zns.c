@@ -1227,6 +1227,7 @@ static uint16_t zns_check_dulbe(NvmeNamespace *ns, uint64_t slba, uint32_t nlb)
 {
     return NVME_SUCCESS;
 }
+
 static uint64_t znsssd_write(ZNS *zns, NvmeRequest *req){
     //FEMU only supports 1 namespace for now (see femu.c:365)
     //and FEMU ZNS Extension use a single thread which mean lockless operations(ch->available_time += ~~) if thread increased
@@ -1285,6 +1286,7 @@ static uint64_t znsssd_write(ZNS *zns, NvmeRequest *req){
     return maxlat;
 
 }
+
 static uint64_t znsssd_read(ZNS *zns, NvmeRequest *req){
     // FEMU only supports 1 namespace for now (see femu.c:365) 
     // and FEMU ZNS Extension use a single thread which mean lockless operations(ch->available_time += ~~) if thread increased 
@@ -1362,7 +1364,6 @@ static uint64_t znsssd_read(ZNS *zns, NvmeRequest *req){
  * @param cmd 
  * @param req 
 }*/
-
 static uint64_t znssd_reset_zones(ZNS *zns, NvmeRequest *req){
     NvmeCmd *cmd = (NvmeCmd *)&req->cmd;
     NvmeNamespace *ns = req->ns;
@@ -1406,6 +1407,7 @@ static uint64_t znssd_reset_zones(ZNS *zns, NvmeRequest *req){
     }
     return maxlat;
 }
+
 static int zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req){
     
     NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
@@ -1581,6 +1583,7 @@ err:
     femu_err("*********ZONE WRITE FAILED*********, Zidx : %lx , STATUS : %x\n", zidx, status);  
     return status | NVME_DNR;
 }
+
 static uint16_t zns_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
                            NvmeRequest *req)
 {
@@ -1620,9 +1623,12 @@ static void zns_set_ctrl(FemuCtrl *n)
 
 static int zns_init_zone_cap(FemuCtrl *n)
 {
+    struct zns *zns = n->zns;
+    struct zns_ssdparams *spp = &zns->sp; 
+
     n->zoned = true;
-    n->zasl_bs = ZNS_ZASL_SIZE_BYTES;
-    n->zone_size_bs = ZNS_ZONE_SIZE_BYTES;
+    n->zasl_bs = spp->zasl;
+    n->zone_size_bs = spp->zone_size;
     n->zone_cap_bs = 0;
     n->cross_zone_read = true;
     n->max_active_zones = 0;
@@ -1654,6 +1660,7 @@ static void zns_init(FemuCtrl *n, Error **errp)
 {
     NvmeNamespace *ns = &n->namespaces[0];
     zns_set_ctrl(n);
+    struct zns *zns = n->zns = g_malloc0(sizeof(struct zns));
     zns_init_zone_cap(n);
     if (zns_init_zone_geometry(ns, errp) != 0) {
         return;
@@ -1664,22 +1671,22 @@ static void zns_init(FemuCtrl *n, Error **errp)
 }
 
 static void znsssd_init_params(FemuCtrl * n, struct zns_ssdparams *spp){
-    spp->pg_rd_lat = NAND_READ_LATENCY;
-    spp->pg_wr_lat = NAND_PROG_LATENCY;
-    spp->blk_er_lat = NAND_ERASE_LATENCY;
-    spp->ch_xfer_lat = NAND_CHNL_PAGE_TRANSFER_LATENCY;
-    /**
-     * 1. SSD size  2. zone size 3. # of chnls 4. # of chnls per zone
-    */
-    spp->nchnls         = 16;   //default : 8                                                   
-    /* FIXME : = ZNS_MAX_CHANNEL channel configuration like this */
-    spp->chnls_per_zone = 8;   
-    spp->zones          = n->num_zones;     
-    spp->ways           = 1;    //default : 2
-    spp->ways_per_zone  = 1;    //default :==spp->ways
-    spp->dies_per_chip  = 1;    //default : 1
-    spp->planes_per_die = 1;    //default : 4
-    spp->register_model = 1;    
+    // spp->pg_rd_lat = NAND_READ_LATENCY;
+    // spp->pg_wr_lat = NAND_PROG_LATENCY;
+    // spp->blk_er_lat = NAND_ERASE_LATENCY;
+    // spp->ch_xfer_lat = NAND_CHNL_PAGE_TRANSFER_LATENCY;
+    // /**
+    //  * 1. SSD size  2. zone size 3. # of chnls 4. # of chnls per zone
+    // */
+    // spp->nchnls         = 16;   //default : 8                                                   
+    // /* FIXME : = ZNS_MAX_CHANNEL channel configuration like this */
+    // spp->chnls_per_zone = 8;   
+    // spp->zones          = n->num_zones;     
+    // spp->ways           = 1;    //default : 2
+    // spp->ways_per_zone  = 1;    //default :==spp->ways
+    // spp->dies_per_chip  = 1;    //default : 1
+    // spp->planes_per_die = 1;    //default : 4
+    // spp->register_model = 1;    
     /*Inho @ Temporarly, FEMU doesn't support more than 1 namespace. Parameters below is for supporting different zone configurations temporarly*/
 
     spp->chnls_per_another_zone = 7;
@@ -1727,15 +1734,15 @@ static void zns_init_chip(struct zns_ssd_lun *ch, struct zns_ssdparams *spp)
         femu_err("zns.c:1754 znssd_init(): lock alloc failed, to inhoinno \n");
 }
 
-static void zns_init_plane(struct zns_ssd_plane *pl, struct zns_ssdparams *spp){
-
+static void zns_init_plane(struct zns_ssd_plane *pl, struct zns_ssdparams *spp)
+{
     pl->next_avail_time=0;
     pl->busy=false;
     pl->nregs=spp->register_model;
 }
 
 void znsssd_init(FemuCtrl * n){
-    struct zns *zns = n->zns = g_malloc0(sizeof(struct zns));
+    struct zns *zns = n->zns;
     struct zns_ssdparams *spp = &zns->sp; 
     zns->namespaces = n->namespaces;
     znsssd_init_params(n, spp);

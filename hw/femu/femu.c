@@ -739,6 +739,21 @@ static Property femu_props[] = {
     DEFINE_PROP_UINT8("lnum_lun", FemuCtrl, oc_params.num_lun, 8),
     DEFINE_PROP_UINT8("lnum_pln", FemuCtrl, oc_params.num_pln, 2),
     DEFINE_PROP_UINT16("lmetasize", FemuCtrl, oc_params.sos, 16),
+    // ZNS lat
+    DEFINE_PROP_UINT64("zns_page_read_latency", FemuCtrl, zns_params.pg_rd_lat, 65000),
+    DEFINE_PROP_UINT64("zns_page_write_latency", FemuCtrl, zns_params.pg_wr_lat, 450000),
+    DEFINE_PROP_UINT64("zns_block_erasure_latency", FemuCtrl, zns_params.blk_er_lat, 3000000),
+    DEFINE_PROP_UINT64("zns_channel_transfer_latency", FemuCtrl, zns_params.ch_xfer_lat, 25000),
+    // ZNS Geo
+    DEFINE_PROP_UINT16("zns_zonesize", FemuCtrl, zns_params.zonesize, (64 * MiB)),
+    DEFINE_PROP_UINT16("zns_channels", FemuCtrl, zns_params.nchnls, 16),
+    DEFINE_PROP_UINT16("zns_channels_per_zone", FemuCtrl, zns_params.chnls_per_zone, 8),
+    DEFINE_PROP_UINT16("zns_ways", FemuCtrl, zns_params.ways, 1),
+    DEFINE_PROP_UINT16("zns_ways_per_zone", FemuCtrl, zns_params.ways_per_zone, 1),
+    DEFINE_PROP_UINT16("zns_dies_per_chip", FemuCtrl, zns_params.dies_per_chip, 1),
+    DEFINE_PROP_UINT16("zns_planes_per_die", FemuCtrl, zns_params.planes_per_die, 1),
+    DEFINE_PROP_UINT64("zns_zasl", FemuCtrl, zns_params.zasl_bs, (128 * KiB)),
+    // End
     DEFINE_PROP_END_OF_LIST(),
 };
 

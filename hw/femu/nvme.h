@@ -1215,6 +1215,33 @@ typedef struct OcCtrlParams {
     uint16_t sos;
 } OcCtrlParams;
 
+
+/**
+ * @brief 
+ * inhoinno: to emulate latency in zns ssd, struct znsssd is needed
+ * extends 'struct ssdparams' in ../bbssd/ftl.h:110
+ */
+typedef struct ZNSParams {
+    uint16_t register_model;    /* =1 single register =2 double register */
+    uint64_t nchnls;            /* # of channels in the SSD */
+    uint64_t ways;              /* # of ways in the SSD */
+    uint64_t zones;             /* # of zones in ZNS SSD */
+    uint64_t chnls_per_zone;    /* ZNS Association degree. # of channels per zone, must be divisor of nchnls */
+    uint64_t ways_per_zone;     /* another ZNS Association degree. # of ways per zone, must be divisor of nways */
+    uint64_t dies_per_chip;
+    uint64_t planes_per_die;      
+    uint64_t csze_pages;        /* #of Pages in Chip (Inhoinno:I guess lun in femu)*/
+    uint64_t nchips;            /* # of chips in SSD*/
+    uint64_t chnls_per_another_zone;    
+    uint64_t pg_rd_lat;         /* NAND page read latency in nanoseconds */
+    uint64_t pg_wr_lat;         /* NAND page program latency in nanoseconds */
+    uint64_t blk_er_lat;        /* NAND block erase latency in nanoseconds */
+    uint64_t zone_reset_lat;    /* ZNS SSD ZONE reset latency in nanoseconds */
+    uint64_t ch_xfer_lat;       /* channel transfer latency for one page in nanoseconds*/
+    uint64_t zone_size;
+    uint64_t zasl;
+} ZNSParams;
+
 struct FemuCtrl;
 typedef struct FemuExtCtrlOps {
     void     *state;
@@ -1352,6 +1379,7 @@ typedef struct FemuCtrl {
     uint8_t         lver; /* Coperd: OCSSD version, 0x1 -> OC1.2, 0x2 -> OC2.0 */
     uint32_t        memsz;
     OcCtrlParams    oc_params;
+    ZNSParams       zns_params;
 
     Oc12Ctrl  *oc12_ctrl;
     volatile int64_t chip_next_avail_time[FEMU_MAX_NUM_CHIPS];

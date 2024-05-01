@@ -453,6 +453,20 @@ controller-level zone mappings to flash chips are work-in-progress.
 ./run-zns.sh
 ```
 
+### ConfZNS configurations
+
+  NAND_READ_LATENCY    = 65000 65us TLC_tREAD(65us : 16K page time)
+  NAND_PROG_LATENCY  = 450us TLC_tProg ,3D time
+  NAND_ERASE_LATENCY = SLC_BLOCK_ERASE_LATENCY_NS,//2000000
+  NAND_CHNL_PAGE_TRANSFER_LATENCY = 2.5? 1200MT = 9600MB/s = 390ns per 4K 
+  //NAND_CHNL_PAGE_TRANSFER_LATENCY = 0,
+  //SK Hynix read     : 400Mb/s for 1 chip..
+  //WD ZN540 4TB read : avg 80us 
+  //ZEMU read         : 
+  //SK Hynix write    : 100Mb/s for 1 chip..
+  //WD ZN540 4TB write: 
+  //ZEMU write        : 5Mb/s for 1 chip...
+
 ### Contributing ###
 
 Github [``issue``](https://github.com/ucare-uchicago/FEMU/issues) and [``pull

@@ -5,27 +5,19 @@
 #define _64KB   (64 * KiB)
 #define _16KB   (16 * KiB)
 #define _4KB    (4 * KiB)
-// #define RESOURCE_UTIL_LOG
+// #define CONFZNS_DEBUG_LOG
 
 enum {
     NAND_READ =  0,
     NAND_WRITE = 1,
     NAND_ERASE = 2,
 
- /* FIXME: */
-    NAND_READ_LATENCY  = 65000,//NAND_READ_LATENCY  = 65000,  //65us TLC_tREAD(65us : 16K page time)
-    NAND_PROG_LATENCY  = 450000,//450us TLC_tProg ,3D time
-    NAND_ERASE_LATENCY = SLC_BLOCK_ERASE_LATENCY_NS,//2000000
-    NAND_CHNL_PAGE_TRANSFER_LATENCY = 25000, // =2.5? 1200MT = 9600MB/s = 390ns per 4K 
-    //NAND_CHNL_PAGE_TRANSFER_LATENCY = 0,
-    //SK Hynix read     : 400Mb/s for 1 chip..
-    //WD ZN540 4TB read : avg 80us 
-    //ZEMU read         : 
-    //SK Hynix write    : 100Mb/s for 1 chip..
-    //WD ZN540 4TB write: 
-    //ZEMU write        : 5Mb/s for 1 chip...
+    NAND_READ_LATENCY  = 65000, // ns
+    NAND_PROG_LATENCY  = 450000, // ns
+    NAND_ERASE_LATENCY = 3000000, // ns
+    NAND_CHNL_PAGE_TRANSFER_LATENCY = 25000, // ns
 
-    ZONE_RESET_LATENCY =  SLC_BLOCK_ERASE_LATENCY_NS,
+    ZONE_RESET_LATENCY =  3000000, // ns
 };
 
 
@@ -41,14 +33,14 @@ typedef struct zns_ssd_channel {
     pthread_spinlock_t time_lock;
     bool busy;
 
-}zns_ssd_channel;
+} zns_ssd_channel;
 
 typedef struct zns_ssd_plane {
     uint64_t next_avail_time; 
     uint64_t nregs;
     bool *is_reg_busy;
     bool busy;
-}zns_ssd_plane;
+} zns_ssd_plane;
 
 /**
  * @brief 
@@ -61,7 +53,7 @@ typedef struct zns_ssd_lun {
     uint64_t next_avail_time; // in nanoseconds
     pthread_spinlock_t time_lock;
     bool busy;
-}zns_ssd_lun;
+} zns_ssd_lun;
 
 /**
  * @brief 
@@ -79,7 +71,6 @@ struct zns_ssdparams{
     uint64_t planes_per_die;      
     uint64_t csze_pages;        /* #of Pages in Chip (Inhoinno:I guess lun in femu)*/
     uint64_t nchips;            /* # of chips in SSD*/
-    bool     is_another_namespace;
     uint64_t chnls_per_another_zone;    
     uint64_t pg_rd_lat;         /* NAND page read latency in nanoseconds */
     uint64_t pg_wr_lat;         /* NAND page program latency in nanoseconds */
@@ -87,6 +78,7 @@ struct zns_ssdparams{
     uint64_t zone_reset_lat;    /* ZNS SSD ZONE reset latency in nanoseconds */
     uint64_t ch_xfer_lat;       /* channel transfer latency for one page in nanoseconds*/
 };
+
 /**
  * @brief 
  * inhoinno: latency emulation with zns ssd, struct znsssd is needed
@@ -94,22 +86,20 @@ struct zns_ssdparams{
  */
 typedef struct zns {
     /*members from struct ssd*/
-    char                *ssdname;
-    struct zns_ssdparams    sp;
+    char *ssdname;
+    struct zns_ssdparams sp;
     struct zns_ssd_channel *ch;
     struct zns_ssd_lun *chips;
     struct zns_ssd_plane *planes;
 
-    /*new members for znsssd*/
-    struct NvmeNamespace    * namespaces;      //FEMU only support 1 namespace For now, 
-    struct NvmeZone      * zone_array;
-    uint32_t            num_zones;
+    /* new members for znsssd */
+    struct NvmeNamespace *namespaces;   // FEMU only support 1 namespace 
+    struct NvmeZone *zone_array;
+    uint32_t num_zones;
     /* lockless ring for communication with NVMe IO thread */
 
-    QemuThread          zns_thread;
-
-
-}ZNS;
+    QemuThread zns_thread;
+} ZNS;
 
 typedef struct QEMU_PACKED NvmeZonedResult {
     uint64_t slba;
@@ -150,7 +140,7 @@ enum NvmeZoneReportType {
 
 enum NvmeZoneType {
     NVME_ZONE_TYPE_RESERVED          = 0x00,
-    //for test, inhoinno
+    // For testing, inhoinno
     NVME_ZONE_TYPE_CONVENTIONAL      = 0x01,
     NVME_ZONE_TYPE_SEQ_WRITE         = 0x02,    
 };
@@ -164,15 +154,16 @@ enum NvmeZoneSendAction {
     NVME_ZONE_ACTION_OFFLINE         = 0x05,
     NVME_ZONE_ACTION_SET_ZD_EXT      = 0x10,
 };
-//NvmeZoneDescripstor
+
+// NvmeZoneDescripstor
 typedef struct QEMU_PACKED NvmeZoneDescr {
-    uint8_t     zt;     //Zone Type(does sequential wirte required? NVME TP4053a section 2.3.1)
-    uint8_t     zs;     //Zone State 
+    uint8_t     zt;     // Zone Type(does sequential wirte required? NVME TP4053a section 2.3.1)
+    uint8_t     zs;     // Zone State 
     uint8_t     za;
     uint8_t     rsvd3[5];
     uint64_t    zcap;
-    uint64_t    zslba;  //Zone Start Logical Block Address
-    uint64_t    wp;     //Write pointer
+    uint64_t    zslba;  // Zone Start Logical Block Address
+    uint64_t    wp;     // Write pointer
     uint8_t     rsvd32[32];
 } NvmeZoneDescr;
 
@@ -277,7 +268,6 @@ static inline void zns_set_zone_state(NvmeZone *zone, NvmeZoneState state)
     //pthread_spin_lock(&zone->w_ptr_lock);
     zone->d.zs = state << 4;
     //pthread_spin_unlock(&zone->w_ptr_lock);
-
 }
 
 static inline uint64_t zns_zone_rd_boundary(NvmeNamespace *ns, NvmeZone *zone)
@@ -347,12 +337,6 @@ static inline void zns_aor_dec_active(NvmeNamespace *ns)
 
 void zns_ns_shutdown(NvmeNamespace *ns);
 void zns_ns_cleanup(NvmeNamespace *ns);
-
-
-//get_zone(Namespace, req)
-//get_ch(Zone, req)
-
 void znsssd_init(FemuCtrl * n);
-static int zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req);
 
 #endif

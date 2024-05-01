@@ -63,7 +63,7 @@ typedef struct zns_ssd_lun {
 typedef struct zns {
     /*members from struct ssd*/
     char *ssdname;
-    struct zns_ssdparams sp;
+    ZNSParams sp;
     struct zns_ssd_channel *ch;
     struct zns_ssd_lun *chips;
     struct zns_ssd_plane *planes;

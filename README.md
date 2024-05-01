@@ -144,7 +144,7 @@ If you want to change the border of each zone groups, change "(zidx < 16)" to so
 static inline uint64_t zns_get_multiway_chip_idx(NvmeNamespace *ns, uint64_t slba){
     FemuCtrl *n = ns->ctrl;
     struct zns * zns = n->zns;
-    struct zns_ssdparams *spp = &zns->sp;
+    ZNSParams *spp = &zns->sp;
     uint64_t zidx= zns_zone_idx(ns, slba);
 
     if (spp->is_another_namespace)

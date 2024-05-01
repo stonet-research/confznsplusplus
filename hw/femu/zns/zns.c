@@ -1777,9 +1777,9 @@ static void zns_exit(FemuCtrl *n)
 
 int nvme_register_znssd(FemuCtrl *n)
 {
-    #ifdef INHOINNO_VERBOSE_SETTING
+#ifdef INHOINNO_VERBOSE_SETTING
     femu_err("zns.c : nvme_register_znsssd(), to inhoinno \n");
-    #endif
+#endif
     n->ext_ops = (FemuExtCtrlOps) {
         .state            = NULL,
         .init             = zns_init,

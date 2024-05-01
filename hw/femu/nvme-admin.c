@@ -126,7 +126,7 @@ static uint16_t nvme_create_sq(FemuCtrl *n, NvmeCmd *cmd)
     }
 
     sq = g_malloc0(sizeof(*sq));
-    femu_err("NVMe sq priority %u qflags %u nvme-admin.c:129\n",NVME_SQ_FLAGS_QPRIO(qflags),qflags);
+    // femu_err("NVMe sq priority %u qflags %u nvme-admin.c:129\n",NVME_SQ_FLAGS_QPRIO(qflags),qflags);
     if (nvme_init_sq(sq, n, prp1, sqid, cqid, qsize + 1, NVME_SQ_FLAGS_QPRIO(qflags), NVME_SQ_FLAGS_PC(qflags))) {
         g_free(sq);
         return NVME_INVALID_FIELD | NVME_DNR;

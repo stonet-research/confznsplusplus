@@ -37,7 +37,7 @@
  */
 #define ADVANCE_PER_CH_ENDTIME 1
 #define SK_HYNIX_VALIDATION 0
-#define MK_ZONE_CONVENTIONAL 5
+#define MK_ZONE_CONVENTIONAL 0
 #define NVME_PRIORITY_SCHED_MODE 1      //future feature for ConfZNS
 
 #define PCIe_TIME_SIMULATION 1

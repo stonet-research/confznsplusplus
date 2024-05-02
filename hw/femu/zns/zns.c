@@ -2,9 +2,9 @@
 #include <math.h>
 #include <signal.h>
 
-#define ZNS_EXTERNAL_PAGE_SIZE (4 * KiB)
-#define ZNS_INTERNAL_PAGE_SIZE (16 * KiB)
-#define ZNS_PAGE_PARALLELISM (ZNS_INTERNAL_PAGE_SIZE / ZNS_EXTERNAL_PAGE_SIZE)
+#define ZNS_EXTERNAL_PAGE_SIZE (4 * KiB)  // Exposed through NVMe
+#define ZNS_INTERNAL_PAGE_SIZE (16 * KiB) // Internal mapped size, the flash page size
+#define ZNS_PAGE_PARALLELISM (ZNS_INTERNAL_PAGE_SIZE / ZNS_EXTERNAL_PAGE_SIZE) // How much parallel I/O fits in one flash page
 #define ZNS_ZASL_SIZE_BYTES (128 * KiB)
 #define ZNS_ZONE_SIZE_BYTES (64 * MiB)
 #define ZNS_ZONE_SIZE_PAGES (ZNS_ZONE_SIZE_BYTES / ZNS_INTERNAL_PAGE_SIZE)
@@ -1708,6 +1708,11 @@ static void znsssd_init_params(FemuCtrl * n, ZNSParams *spp){
     spp->ways_per_zone  = spp_param->ways_per_zone;    //default :==spp->ways
     spp->dies_per_chip  = spp_param->dies_per_chip;    //default : 1
     spp->planes_per_die = spp_param->planes_per_die;    //default : 4
+    spp->block_size     = spp_param->block_size;
+    uint64_t bytes_per_block = spp->block_size * ZNS_INTERNAL_PAGE_SIZE;
+    uint64_t zns_stripe_size_bs = bytes_per_block * spp->ways_per_zone * spp->chnls_per_zone;
+    assert(n->zone_size_bs % zns_stripe_size_bs == 0);
+    spp->blocks_per_die = n->zone_size_bs  / zns_stripe_size_bs;
     spp->register_model = spp_param->register_model;    
     /*Inho @ Temporarly, FEMU doesn't support more than 1 namespace. Parameters below is for supporting different zone configurations temporarly*/
 
@@ -1726,9 +1731,9 @@ static void znsssd_init_params(FemuCtrl * n, ZNSParams *spp){
     femu_log("| nchnl       : %lu   | nway      : %lu   |\n", spp->nchnls, spp->ways);
     femu_log("| nchnl/zone  : %lu   | nway/zone : %lu   |\n", spp->chnls_per_zone, spp->ways_per_zone);
     femu_log("| die/chip    : %lu   |           :       |\n", spp->dies_per_chip);
-    femu_log("| plane/die   : %lu   |           :       |\n", spp->planes_per_die);
-    femu_log("| block       :       |           :       |\n");
-    femu_log("| page        : %ldKiB| zones     :  %lu  |\n", (ZNS_INTERNAL_PAGE_SIZE/KiB), spp->zones);
+    femu_log("| plane/die   : %lu   | block/die : %lu  |\n", spp->planes_per_die, spp->blocks_per_die);
+    femu_log("| pages/block : %lu   |  stripe   : %lu   |\n", spp->block_size, zns_stripe_size_bs / ZNS_INTERNAL_PAGE_SIZE);
+    femu_log("| page        : %ldKiB|  zones    : %lu  |\n", (ZNS_INTERNAL_PAGE_SIZE/KiB), spp->zones);
     femu_log("===========================================\n");
 }
 

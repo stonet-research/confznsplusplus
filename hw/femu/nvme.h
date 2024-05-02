@@ -1239,6 +1239,8 @@ typedef struct ZNSParams {
     uint64_t zone_reset_lat;    /* ZNS SSD ZONE reset latency in nanoseconds */
     uint64_t ch_xfer_lat;       /* channel transfer latency for one page in nanoseconds*/
     uint64_t zone_size;
+    uint64_t block_size;        /* ZNS size of a block in pages */
+    uint64_t blocks_per_die;   
     uint64_t zasl;
 } ZNSParams;
 

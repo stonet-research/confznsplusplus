@@ -745,6 +745,7 @@ static Property femu_props[] = {
     DEFINE_PROP_UINT64("zns_block_erasure_latency", FemuCtrl, zns_params.blk_er_lat, 3000000),
     DEFINE_PROP_UINT64("zns_channel_transfer_latency", FemuCtrl, zns_params.ch_xfer_lat, 25000),
     // ZNS Geo
+    DEFINE_PROP_UINT64("zns_block_size_pages", FemuCtrl, zns_params.block_size, 256),
     DEFINE_PROP_UINT64("zns_zonesize", FemuCtrl, zns_params.zone_size, (64 * MiB)),
     DEFINE_PROP_UINT64("zns_channels", FemuCtrl, zns_params.nchnls, 16),
     DEFINE_PROP_UINT64("zns_channels_per_zone", FemuCtrl, zns_params.chnls_per_zone, 8),

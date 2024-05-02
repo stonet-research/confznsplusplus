@@ -754,6 +754,9 @@ static Property femu_props[] = {
     DEFINE_PROP_UINT64("zns_dies_per_chip", FemuCtrl, zns_params.dies_per_chip, 1U),
     DEFINE_PROP_UINT64("zns_planes_per_die", FemuCtrl, zns_params.planes_per_die, 1U),
     DEFINE_PROP_UINT64("zns_zasl", FemuCtrl, zns_params.zasl, (128ULL * KiB)),
+    // ZNS modes
+    DEFINE_PROP_UINT8("zns_allow_partial_resets", FemuCtrl, zns_params.allow_partial_zone_resets, 1),
+    DEFINE_PROP_UINT8("zns_asynchronous_resets", FemuCtrl, zns_params.asynchronous_resets, 1),
     // End
     DEFINE_PROP_END_OF_LIST(),
 };

@@ -1428,7 +1428,7 @@ static uint64_t znssd_reset_zones(ZNS *zns, NvmeRequest *req){
         return 0;
     }
     uint64_t zone_chunk = n->zone_size / spp->blocks_per_die;
-    uint64_t blocks_to_erase = (filled + zone_chunk - 1) / zone_chunk;
+    uint64_t blocks_to_erase = spp->allow_partial_zone_resets ? (filled + zone_chunk - 1) / zone_chunk : spp->blocks_per_die;
 
     // Erase in chunks
     for (uint64_t b = 0; b < blocks_to_erase; b++) {
@@ -1436,8 +1436,8 @@ static uint64_t znssd_reset_zones(ZNS *zns, NvmeRequest *req){
         for (int i = 0; i < spp->ways_per_zone * spp->chnls_per_zone; i++) {
             int step = i * (ZNS_INTERNAL_PAGE_SIZE / 512);
             uint64_t my_plane_idx = zns_get_plane_idx(ns, slba + step);
-            femu_err("DEBUG erasure: %lu %lu %lu %lu %lu\n", slba+step, zns_get_ppn_idx(ns, slba+step), my_plane_idx, 
-                (spp->ways * spp->planes_per_die* spp->dies_per_chip * spp->nchnls), b);
+            femu_err("DEBUG erasure: %lu %lu %lu %lu %lu %u\n", slba+step, zns_get_ppn_idx(ns, slba+step), my_plane_idx, 
+                (spp->ways * spp->planes_per_die* spp->dies_per_chip * spp->nchnls), b, spp->allow_partial_zone_resets);
             plane= &(zns->planes[my_plane_idx]);
             plane->next_avail_time = plane->next_avail_time > cmd_stime ? 
                     plane->next_avail_time + spp->blk_er_lat : cmd_stime + spp->blk_er_lat;
@@ -1719,6 +1719,9 @@ static void zns_init(FemuCtrl *n, Error **errp)
 
 static void znsssd_init_params(FemuCtrl * n, ZNSParams *spp){
     ZNSParams *spp_param = &(n->zns_params); 
+
+    spp->allow_partial_zone_resets = spp_param->allow_partial_zone_resets;
+    spp->asynchronous_resets = spp_param->asynchronous_resets;
 
     spp->pg_rd_lat = spp_param->pg_rd_lat;
     spp->pg_wr_lat = spp_param->pg_wr_lat;

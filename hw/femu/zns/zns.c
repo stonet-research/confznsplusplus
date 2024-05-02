@@ -73,7 +73,8 @@ static inline uint64_t zns_get_chip_idx(NvmeNamespace *ns, uint64_t slba)
     FemuCtrl *n = ns->ctrl;
     struct zns *zns = n->zns;
     ZNSParams *ssd_param = &zns->sp;
-    uint64_t zidx = zns_get_zone_idx(ns, slba);
+    // Why is zidx not used here?
+    // uint64_t zidx = zns_get_zone_idx(ns, slba);
     uint64_t ppn = zns_get_ppn_idx(ns,slba);
     return (ppn / ssd_param->planes_per_die) % (ssd_param->nchnls * ssd_param->ways);
 }
@@ -85,7 +86,7 @@ static inline uint64_t zns_get_chip_idx(NvmeNamespace *ns, uint64_t slba)
  * @param slba      start lba
  * @return chnl_idx
  */
-static inline uint64_t zns_advanced_chnl_idx(NvmeNamespace *ns, uint64_t slba)
+static inline uint64_t zns_get_chnl_idx(NvmeNamespace *ns, uint64_t slba)
 {    
     FemuCtrl *n = ns->ctrl;
     struct zns * zns = n->zns;
@@ -1246,6 +1247,7 @@ static uint64_t znsssd_write(ZNS *zns, NvmeRequest *req){
         zone = zns_get_zone_by_slba(ns, slba);
         slba = zone->w_ptr;
     }
+
     uint64_t nand_stime = 0;
     uint64_t cmd_stime = 0;
     zns_ssd_channel *chnl = NULL;
@@ -1254,6 +1256,13 @@ static uint64_t znsssd_write(ZNS *zns, NvmeRequest *req){
     uint32_t my_chnl_idx = 0;
     uint64_t chnl_stime = req->stime == 0 ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : req->stime;
 
+
+    if (req->stime == 0) {
+        cmd_stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    } else {
+        cmd_stime = req->stime;
+    }
+
     for (uint64_t i = 0; i < nlb ; i += (ZNS_INTERNAL_PAGE_SIZE / 512)) {
         slba += i;
 #if ADVANCE_PER_CH_ENDTIME
@@ -1261,7 +1270,7 @@ static uint64_t znsssd_write(ZNS *zns, NvmeRequest *req){
         my_chnl_idx = hynix_zns_get_chnl_idx(ns, slba); // SK Hynix
 #endif
 #if !(SK_HYNIX_VALIDATION)
-        my_chnl_idx=zns_advanced_chnl_idx(ns, slba); 
+        my_chnl_idx=zns_get_chnl_idx(ns, slba); 
 #endif
         my_plane_idx = zns_get_plane_idx(ns, slba); 
         chnl = &(zns->ch[my_chnl_idx]);
@@ -1314,7 +1323,7 @@ static uint64_t znsssd_read(ZNS *zns, NvmeRequest *req){
     for (uint64_t i = 0; i < nlb; i += (ZNS_INTERNAL_PAGE_SIZE / 512)) {
         slba += i;
 
-        my_chnl_idx = zns_advanced_chnl_idx(ns, slba); 
+        my_chnl_idx = zns_get_chnl_idx(ns, slba); 
         my_plane_idx = zns_get_plane_idx(ns, slba);
         chnl = &(zns->ch[my_chnl_idx]);
         plane= &(zns->planes[my_plane_idx]);
@@ -1379,17 +1388,18 @@ static uint64_t znssd_reset_zones(ZNS *zns, NvmeRequest *req){
     //zns_ssd_channel *chnl =NULL;
 
     uint64_t slba = 0;
-    uint64_t cmd_stime = (req->stime == 0) ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : req->stime ;
+    uint64_t cmd_stime = (req->stime == 0) ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : req->stime;
 
-    uint64_t maxlat=0;
-    uint64_t lat =0;
+    uint64_t maxlat = 0;
+    uint64_t lat = 0;
     //uint16_t status;
 
     zns_get_mgmt_zone_slba_idx(n, cmd, &slba, &zone_idx);
 #if SK_HYNIX_VALIDATION
     chip_idx = zone_idx % (spp->nchnls * spp->ways);
     chip = &(zns->chips[chip_idx]);
-    chip->next_avail_time = (chip->next_avail_time > cmd_stime)? chip->next_avail_time + ZONE_RESET_LATENCY : cmd_stime + ZONE_RESET_LATENCY;
+    chip->next_avail_time = (chip->next_avail_time > cmd_stime) ? 
+        chip->next_avail_time + spp->blk_er_lat : cmd_stime + spp->blk_er_lat;
     return (chip->next_avail_time - cmd_stime);
 #endif
     //default
@@ -1401,7 +1411,8 @@ static uint64_t znssd_reset_zones(ZNS *zns, NvmeRequest *req){
         for(uint64_t i =0 ; i < spp->ways ; i++){
             chip_idx += (i*spp->nchnls);
             chip = &(zns->chips[chip_idx]);
-            chip->next_avail_time = (chip->next_avail_time > cmd_stime)? chip->next_avail_time + ZONE_RESET_LATENCY : cmd_stime + ZONE_RESET_LATENCY;
+            chip->next_avail_time = chip->next_avail_time > cmd_stime ? 
+                chip->next_avail_time + spp->blk_er_lat : cmd_stime + spp->blk_er_lat;
             lat = chip->next_avail_time - cmd_stime;
             maxlat = (maxlat < lat) ? lat : maxlat;
         }
@@ -1418,18 +1429,24 @@ static int zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, Nvme
 
     uint8_t action;
     action = dw13 & 0xff;
+    int out = 0;
 
     // Zone Reset 
     if (action == NVME_ZONE_ACTION_RESET){
         //reset zone->wp and zone->status=Empty
         //reset zone, causing every chip lat +
-        return znssd_reset_zones(n->zns,req);
+        out = znssd_reset_zones(n->zns,req);
+        return out;
     }
     // Read, Write 
     assert(opcode == NVME_CMD_WRITE || opcode == NVME_CMD_READ || opcode == NVME_CMD_ZONE_APPEND);
-    if(req->is_write)
-        return znsssd_write(n->zns, req);
-    return znsssd_read(n->zns, req);
+    if(req->is_write) {
+        out = znsssd_write(n->zns, req);
+    }
+    else { 
+        out = znsssd_read(n->zns, req);
+    }
+    return out;
 }
 
 static uint16_t zns_read(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
@@ -1591,8 +1608,10 @@ static uint16_t zns_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
 {
     switch (cmd->opcode) {
     case NVME_CMD_READ:
+        // femu_log("ZNS READ cmd->opcode %d %x\n",cmd->opcode, cmd->opcode);
         return zns_read(n, ns, cmd, req);
     case NVME_CMD_WRITE:
+        // femu_log("ZNS WRITE cmd->opcode %d %x\n",cmd->opcode, cmd->opcode);
         return zns_write(n, ns, cmd, req);
     case NVME_CMD_ZONE_MGMT_SEND:
         return zns_zone_mgmt_send(n, req);
@@ -1625,7 +1644,6 @@ static void zns_set_ctrl(FemuCtrl *n)
 
 static int zns_init_zone_cap(FemuCtrl *n)
 {
-    struct zns *zns = n->zns;
     ZNSParams *spp = &(n->zns_params); 
 
     n->zoned = true;
@@ -1662,7 +1680,7 @@ static void zns_init(FemuCtrl *n, Error **errp)
 {
     NvmeNamespace *ns = &n->namespaces[0];
     zns_set_ctrl(n);
-    struct zns *zns = n->zns = g_malloc0(sizeof(struct zns));
+    n->zns = g_malloc0(sizeof(struct zns));
     zns_init_zone_cap(n);
     if (zns_init_zone_geometry(ns, errp) != 0) {
         return;
@@ -1701,6 +1719,9 @@ static void znsssd_init_params(FemuCtrl * n, ZNSParams *spp){
         / ZNS_EXTERNAL_PAGE_SIZE / spp->csze_pages;
     femu_log("===========================================\n");
     femu_log("|        ConfZNS HW Configuration()       |\n");      
+    femu_log("===========================================\n");
+    femu_log("| proglat     : %lu   | readlat   : %lu   |\n", spp->pg_wr_lat, spp->pg_rd_lat);
+    femu_log("| eraslat     : %lu   | xferlat   : %lu   |\n", spp->blk_er_lat, spp->ch_xfer_lat);
     femu_log("===========================================\n");
     femu_log("| nchnl       : %lu   | nway      : %lu   |\n", spp->nchnls, spp->ways);
     femu_log("| nchnl/zone  : %lu   | nway/zone : %lu   |\n", spp->chnls_per_zone, spp->ways_per_zone);

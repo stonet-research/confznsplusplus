@@ -935,8 +935,8 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
                 NVME_PROC_FULL_ZONES;
         }
         *resets = 1;
-        status = zns_do_zone_op(ns, zone, proc_mask, zns_reset_zone, req);
         req->expire_time += zns_advance_status(n, ns, cmd, req);
+        status = zns_do_zone_op(ns, zone, proc_mask, zns_reset_zone, req);
         (*resets)--;
         // femu_err("zone reset    action:%c   slba:%ld     zone_idx:%d    req->expire_time(%lu) - req->stime(%lu):%lu\n",action, req->slba ,zone_idx,req->expire_time,req->stime,(req->expire_time - req->stime));
         return NVME_SUCCESS;
@@ -1386,6 +1386,7 @@ static uint64_t znssd_reset_zones(ZNS *zns, NvmeRequest *req){
     uint32_t chip_idx=0;
     uint32_t chip_start_idx=0;
     //zns_ssd_channel *chnl =NULL;
+    zns_ssd_plane *plane = NULL;
 
     uint64_t slba = 0;
     uint64_t cmd_stime = (req->stime == 0) ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : req->stime;
@@ -1395,28 +1396,54 @@ static uint64_t znssd_reset_zones(ZNS *zns, NvmeRequest *req){
     //uint16_t status;
 
     zns_get_mgmt_zone_slba_idx(n, cmd, &slba, &zone_idx);
-#if SK_HYNIX_VALIDATION
-    chip_idx = zone_idx % (spp->nchnls * spp->ways);
-    chip = &(zns->chips[chip_idx]);
-    chip->next_avail_time = (chip->next_avail_time > cmd_stime) ? 
-        chip->next_avail_time + spp->blk_er_lat : cmd_stime + spp->blk_er_lat;
-    return (chip->next_avail_time - cmd_stime);
-#endif
-    //default
-    chip_start_idx = zone_idx % (spp->nchnls / spp->chnls_per_zone);
-    chip_idx = chip_start_idx;
     n->zone_array[zone_idx].cnt_reset +=1;
+// #if SK_HYNIX_VALIDATION
+//     chip_idx = zone_idx % (spp->nchnls * spp->ways);
+//     chip = &(zns->chips[chip_idx]);
+//     chip->next_avail_time = (chip->next_avail_time > cmd_stime) ? 
+//         chip->next_avail_time + spp->blk_er_lat : cmd_stime + spp->blk_er_lat;
+//     return (chip->next_avail_time - cmd_stime);
+// #endif
+//     //default
+//     chip_start_idx = zone_idx % (spp->nchnls / spp->chnls_per_zone);
+//     chip_idx = chip_start_idx;
+//     n->zone_array[zone_idx].cnt_reset +=1;
 
-    for(uint64_t ass=0; ass < spp->chnls_per_zone; ass++){
-        for(uint64_t i =0 ; i < spp->ways ; i++){
-            chip_idx += (i*spp->nchnls);
-            chip = &(zns->chips[chip_idx]);
-            chip->next_avail_time = chip->next_avail_time > cmd_stime ? 
-                chip->next_avail_time + spp->blk_er_lat : cmd_stime + spp->blk_er_lat;
-            lat = chip->next_avail_time - cmd_stime;
+//     for(uint64_t ass=0; ass < spp->chnls_per_zone; ass++){
+//         for(uint64_t i =0 ; i < spp->ways ; i++){
+//             chip_idx += (i*spp->nchnls);
+//             chip = &(zns->chips[chip_idx]);
+//             chip->next_avail_time = chip->next_avail_time > cmd_stime ? 
+//                 chip->next_avail_time + spp->blk_er_lat : cmd_stime + spp->blk_er_lat;
+//             lat = chip->next_avail_time - cmd_stime;
+//             maxlat = (maxlat < lat) ? lat : maxlat;
+//         }
+//         chip_idx += 1; 
+//     }
+
+    // Part of zone filled
+    NvmeZone *zone = &n->zone_array[zone_idx];
+    uint64_t filled = zone->w_ptr - zone->d.zslba;
+    if (!filled) {
+        return 0;
+    }
+    uint64_t zone_chunk = n->zone_size / spp->blocks_per_die;
+    uint64_t blocks_to_erase = (filled + zone_chunk - 1) / zone_chunk;
+
+    // Erase in chunks
+    for (uint64_t b = 0; b < blocks_to_erase; b++) {
+        // Get all associated planes
+        for (int i = 0; i < spp->ways_per_zone * spp->chnls_per_zone; i++) {
+            int step = i * (ZNS_INTERNAL_PAGE_SIZE / 512);
+            uint64_t my_plane_idx = zns_get_plane_idx(ns, slba + step);
+            femu_err("DEBUG erasure: %lu %lu %lu %lu %lu\n", slba+step, zns_get_ppn_idx(ns, slba+step), my_plane_idx, 
+                (spp->ways * spp->planes_per_die* spp->dies_per_chip * spp->nchnls), b);
+            plane= &(zns->planes[my_plane_idx]);
+            plane->next_avail_time = plane->next_avail_time > cmd_stime ? 
+                    plane->next_avail_time + spp->blk_er_lat : cmd_stime + spp->blk_er_lat;
+            lat = plane->next_avail_time - cmd_stime;
             maxlat = (maxlat < lat) ? lat : maxlat;
         }
-        chip_idx += 1; 
     }
     return maxlat;
 }

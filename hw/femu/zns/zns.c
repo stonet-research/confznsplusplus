@@ -148,6 +148,8 @@ static int zns_init_zone_geometry(NvmeNamespace *ns, Error **errp)
         zone_cap = zone_size;
     }
 
+    femu_err("Zone size %lu zone cap %lu\n", zone_size, zone_cap);
+
     if (zone_cap > zone_size) {
         femu_err("zone capacity %luB > zone size %luB", zone_cap, zone_size);
         return -1;
@@ -1009,7 +1011,10 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
         if (all) {
             proc_mask = NVME_PROC_OPENED_ZONES | NVME_PROC_CLOSED_ZONES;
         }
+        req->expire_time += zns_advance_status(n, ns, cmd, req);
         status = zns_do_zone_op(ns, zone, proc_mask, zns_finish_zone, req);
+        femu_err("zone finish action:%c slba:%ld zone_idx:%d req->expire_time(%lu) - req->stime(%lu):%lu\n",
+            action, req->slba ,logical_zone_idx,req->expire_time,req->stime,(req->expire_time - req->stime));
         break;
     case NVME_ZONE_ACTION_RESET:
         resets = (uintptr_t *)&req->opaque;
@@ -1489,7 +1494,7 @@ static uint64_t zns_advance_status_reset(ZNS *zns, NvmeRequest *req){
         if (!filled) {
             return 0;
         }
-        uint64_t zone_chunk = n->zone_size / spp->blocks_per_die;
+        uint64_t zone_chunk = n->zone_capacity / spp->blocks_per_die;
         blocks_to_erase = spp->allow_partial_zone_resets ? (filled + zone_chunk - 1) / zone_chunk : spp->blocks_per_die;
         physical_zone->w_ptr = physical_zone->d.zslba;
     }
@@ -1512,6 +1517,65 @@ static uint64_t zns_advance_status_reset(ZNS *zns, NvmeRequest *req){
     return maxlat;
 }
 
+static uint64_t zns_advance_status_finish(ZNS *zns, NvmeRequest *req){
+    // For now just synchronous at high write size (note that we do not actually have to write something)
+    NvmeCmd *cmd = (NvmeCmd *)&req->cmd;
+    NvmeNamespace *ns = req->ns;
+    FemuCtrl *n = ns->ctrl;
+    ZNSParams * spp = &zns->sp;
+    uint32_t logical_zone_idx = 0;
+    uint32_t physical_zone_idx = 0;
+    zns_ssd_channel *chnl = NULL;
+    zns_ssd_plane *plane = NULL;
+    uint32_t my_plane_idx = 0;
+    uint32_t my_chnl_idx = 0;
+
+    uint64_t slba = 0;
+    uint64_t cmd_stime = (req->stime == 0) ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : req->stime;
+
+    uint64_t maxlat = 0;
+    uint64_t lat = 0;
+    uint64_t nand_stime = 0;
+    uint64_t chnl_stime = req->stime == 0 ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : req->stime;
+
+    // Get pages to write
+    zns_get_mgmt_zone_slba_idx(n, cmd, &slba, &logical_zone_idx, &physical_zone_idx);
+    NvmeZone *logical_zone  = &n->zvtable->entries[logical_zone_idx].logical_zone;
+    uint64_t pages_to_write = n->zone_capacity - (logical_zone->w_ptr - logical_zone->d.zslba);
+    // Nothing to write, but there is some RTT latency account for that
+    if (!pages_to_write || pages_to_write == n->zone_capacity) {
+        slba = logical_zone->w_ptr;
+        my_chnl_idx=zns_get_chnl_idx(ns, slba); 
+        chnl = &(zns->ch[my_chnl_idx]);
+        chnl_stime = (chnl->next_ch_avail_time < cmd_stime) ? cmd_stime : chnl->next_ch_avail_time;
+        chnl->next_ch_avail_time = chnl_stime + spp->ch_xfer_lat;
+        lat = chnl->next_ch_avail_time - cmd_stime;
+        maxlat = (maxlat < lat) ? lat : maxlat;
+        
+        return maxlat;
+    }
+
+    // 1 MiB chunks are safe
+    slba = logical_zone->w_ptr;
+    for (uint64_t i = 0; i < pages_to_write ; i += (ZNS_INTERNAL_PAGE_SIZE / 512)) {
+        my_chnl_idx=zns_get_chnl_idx(ns, slba); 
+        chnl = &(zns->ch[my_chnl_idx]);
+        chnl_stime = (chnl->next_ch_avail_time < cmd_stime) ? cmd_stime : chnl->next_ch_avail_time;
+        chnl->next_ch_avail_time = chnl_stime + spp->ch_xfer_lat;
+
+        my_plane_idx = zns_get_plane_idx(ns, slba); 
+        plane= &(zns->planes[my_plane_idx]);
+        nand_stime = (plane->next_avail_time < chnl->next_ch_avail_time) ? chnl->next_ch_avail_time : \
+            plane->next_avail_time;
+        plane->next_avail_time = nand_stime + spp->pg_wr_lat;
+        lat = plane->next_avail_time - cmd_stime;
+
+        maxlat = (maxlat < lat) ? lat : maxlat;
+    }
+
+    return maxlat;
+}
+
 static int zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req){
     
     NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
@@ -1526,7 +1590,12 @@ static int zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, Nvme
     if (action == NVME_ZONE_ACTION_RESET){
         //reset zone->wp and zone->status=Empty
         //reset zone, causing every chip lat +
-        out = zns_advance_status_reset(n->zns,req);
+        out = zns_advance_status_reset(n->zns, req);
+        return out;
+    }
+    // Finish
+    if (action == NVME_ZONE_ACTION_FINISH) {
+        out = zns_advance_status_finish(n->zns, req);
         return out;
     }
     // Read, Write 
@@ -1596,10 +1665,6 @@ static uint16_t zns_io_read(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     req->expire_time += zns_advance_status(n,ns,cmd,req);
     /*PCI latency model here*/
 
-// #if PCIe_TIME_SIMULATION
-//     //lock
-//     //pthread_spin_lock(&n->pci_lock);
-//     if(pcie->ntime + 2000 <  req->stime ){
 //         lag=0;
 //         pcie->stime = req->stime;
 //         pcie->ntime = pcie->stime + Interface_PCIeGen3x4_bwmb/ZNS_ZASL_SIZE_BYTES/1000 * delta_time;
@@ -1740,7 +1805,7 @@ static int zns_init_zone_cap(FemuCtrl *n)
     n->zoned = true;
     n->zasl_bs = spp->zasl;
     n->zone_size_bs = spp->zone_size;
-    n->zone_cap_bs = 0;
+    n->zone_cap_bs = spp->zone_cap_param;
     n->cross_zone_read = true;
     n->max_active_zones = 0;
     n->max_open_zones = 0;
@@ -1805,8 +1870,9 @@ static void znsssd_init_params(FemuCtrl * n, ZNSParams *spp){
     spp->block_size     = spp_param->block_size;
     uint64_t bytes_per_block = spp->block_size * ZNS_INTERNAL_PAGE_SIZE;
     uint64_t zns_stripe_size_bs = bytes_per_block * spp->ways_per_zone * spp->chnls_per_zone;
-    assert(n->zone_size_bs % zns_stripe_size_bs == 0);
-    spp->blocks_per_die = n->zone_size_bs  / zns_stripe_size_bs;
+    femu_err("Stripe size %lu %lu %lu\n", n->zone_cap_bs, zns_stripe_size_bs, n->zone_cap_bs % zns_stripe_size_bs);
+    assert(n->zone_cap_bs % zns_stripe_size_bs == 0);
+    spp->blocks_per_die = n->zone_cap_bs  / zns_stripe_size_bs;
     spp->register_model = spp_param->register_model;    
     /*Inho @ Temporarly, FEMU doesn't support more than 1 namespace. Parameters below is for supporting different zone configurations temporarly*/
 

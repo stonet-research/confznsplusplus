@@ -1240,6 +1240,7 @@ typedef struct ZNSParams {
     uint64_t zone_reset_lat;    /* ZNS SSD ZONE reset latency in nanoseconds */
     uint64_t ch_xfer_lat;       /* channel transfer latency for one page in nanoseconds*/
     uint64_t zone_size;
+    uint64_t zone_cap_param;
     uint64_t block_size;        /* ZNS size of a block in pages */
     uint64_t blocks_per_die;
     // erasure modes
@@ -1276,7 +1277,7 @@ typedef struct FemuCtrl {
     bool            zoned;
     bool            cross_zone_read;
     uint64_t        zone_size_bs;
-    bool            zone_cap_bs;
+    uint64_t            zone_cap_bs;
     uint32_t        max_active_zones;
     uint32_t        max_open_zones;
     uint32_t        zd_extension_size;

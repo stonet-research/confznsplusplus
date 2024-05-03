@@ -20,6 +20,8 @@ enum {
     ZONE_RESET_LATENCY =  3000000, // ns
 };
 
+typedef struct zns_vtable_entry;
+
 
 /**
  * @brief 
@@ -57,37 +59,13 @@ typedef struct zns_ssd_lun {
 
 /**
  * @brief 
- * inhoinno: to emulate latency in zns ssd, struct znsssd is needed
- * extends 'struct ssdparams' in ../bbssd/ftl.h:110
- */
-struct zns_ssdparams{
-    uint16_t register_model;    /* =1 single register =2 double register */
-    uint64_t nchnls;            /* # of channels in the SSD */
-    uint64_t ways;              /* # of ways in the SSD */
-    uint64_t zones;             /* # of zones in ZNS SSD */
-    uint64_t chnls_per_zone;    /* ZNS Association degree. # of channels per zone, must be divisor of nchnls */
-    uint64_t ways_per_zone;     /* another ZNS Association degree. # of ways per zone, must be divisor of nways */
-    uint64_t dies_per_chip;
-    uint64_t planes_per_die;      
-    uint64_t csze_pages;        /* #of Pages in Chip (Inhoinno:I guess lun in femu)*/
-    uint64_t nchips;            /* # of chips in SSD*/
-    uint64_t chnls_per_another_zone;    
-    uint64_t pg_rd_lat;         /* NAND page read latency in nanoseconds */
-    uint64_t pg_wr_lat;         /* NAND page program latency in nanoseconds */
-    uint64_t blk_er_lat;        /* NAND block erase latency in nanoseconds */
-    uint64_t zone_reset_lat;    /* ZNS SSD ZONE reset latency in nanoseconds */
-    uint64_t ch_xfer_lat;       /* channel transfer latency for one page in nanoseconds*/
-};
-
-/**
- * @brief 
  * inhoinno: latency emulation with zns ssd, struct znsssd is needed
  * extends 'struct ssd' in ../bbssd/ftl.h:197 
  */
 typedef struct zns {
     /*members from struct ssd*/
     char *ssdname;
-    struct zns_ssdparams sp;
+    ZNSParams sp;
     struct zns_ssd_channel *ch;
     struct zns_ssd_lun *chips;
     struct zns_ssd_plane *planes;
@@ -95,6 +73,7 @@ typedef struct zns {
     /* new members for znsssd */
     struct NvmeNamespace *namespaces;   // FEMU only support 1 namespace 
     struct NvmeZone *zone_array;
+    struct zns_vtable_entry *ventry;
     uint32_t num_zones;
     /* lockless ring for communication with NVMe IO thread */
 
@@ -219,6 +198,28 @@ typedef struct NvmeNamespaceParams {
     uint32_t max_open_zones;
     uint32_t zd_extension_size;
 } NvmeNamespaceParams;
+
+
+typedef enum VirtualZoneState {
+    NVME_VZONE_UNASSIGNED = 0x0,
+    NVME_VZONE_ACTIVE     = 0x1,
+    NVME_VZONE_INVALID    = 0x2,
+} VirtualZoneState;
+
+typedef struct zns_vtable_entry {
+    NvmeZone logical_zone;
+    NvmeZone *physical_zone;
+    uint8_t status;
+} zns_vtable_entry;
+
+typedef struct zns_vtable {
+    zns_vtable_entry* entries; 
+    int number_of_zones;
+
+    QTAILQ_HEAD(, NvmeZone) free_zones;
+    QTAILQ_HEAD(, NvmeZone) invalid_zones;
+    QTAILQ_HEAD(, NvmeZone) active_zones;
+} zns_vtable;
 
 static inline uint32_t zns_nsid(NvmeNamespace *ns)
 {

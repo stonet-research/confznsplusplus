@@ -1012,9 +1012,11 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
             proc_mask = NVME_PROC_OPENED_ZONES | NVME_PROC_CLOSED_ZONES;
         }
         req->expire_time += zns_advance_status(n, ns, cmd, req);
+        // femu_err("Finishing a zone at %lu\n", req->slba);
         status = zns_do_zone_op(ns, zone, proc_mask, zns_finish_zone, req);
         femu_err("zone finish action:%c slba:%ld zone_idx:%d req->expire_time(%lu) - req->stime(%lu):%lu\n",
             action, req->slba ,logical_zone_idx,req->expire_time,req->stime,(req->expire_time - req->stime));
+        // femu_err("Finished a zone at %lu\n", req->slba);
         break;
     case NVME_ZONE_ACTION_RESET:
         resets = (uintptr_t *)&req->opaque;
@@ -1492,7 +1494,7 @@ static uint64_t zns_advance_status_reset(ZNS *zns, NvmeRequest *req){
         NvmeZone *physical_zone = n->zvtable->entries[logical_zone_idx].physical_zone;
         uint64_t filled = physical_zone->w_ptr - physical_zone->d.zslba;
         if (!filled) {
-            return 0;
+            return maxlat;
         }
         uint64_t zone_chunk = n->zone_capacity / spp->blocks_per_die;
         blocks_to_erase = spp->allow_partial_zone_resets ? (filled + zone_chunk - 1) / zone_chunk : spp->blocks_per_die;
@@ -1551,7 +1553,7 @@ static uint64_t zns_advance_status_finish(ZNS *zns, NvmeRequest *req){
         chnl->next_ch_avail_time = chnl_stime + spp->ch_xfer_lat;
         lat = chnl->next_ch_avail_time - cmd_stime;
         maxlat = (maxlat < lat) ? lat : maxlat;
-        
+
         return maxlat;
     }
 
@@ -1848,6 +1850,8 @@ static void zns_init(FemuCtrl *n, Error **errp)
 
 static void znsssd_init_params(FemuCtrl * n, ZNSParams *spp){
     ZNSParams *spp_param = &(n->zns_params); 
+    NvmeNamespace *ns = &n->namespaces[0];
+    uint32_t lbasz = 1 << zns_ns_lbads(ns);
 
     spp->allow_partial_zone_resets = spp_param->allow_partial_zone_resets;
     spp->asynchronous_resets = spp_param->asynchronous_resets;
@@ -1871,8 +1875,8 @@ static void znsssd_init_params(FemuCtrl * n, ZNSParams *spp){
     uint64_t bytes_per_block = spp->block_size * ZNS_INTERNAL_PAGE_SIZE;
     uint64_t zns_stripe_size_bs = bytes_per_block * spp->ways_per_zone * spp->chnls_per_zone;
     femu_err("Stripe size %lu %lu %lu\n", n->zone_cap_bs, zns_stripe_size_bs, n->zone_cap_bs % zns_stripe_size_bs);
-    assert(n->zone_cap_bs % zns_stripe_size_bs == 0);
-    spp->blocks_per_die = n->zone_cap_bs  / zns_stripe_size_bs;
+    assert((n->zone_capacity * lbasz) % zns_stripe_size_bs == 0);
+    spp->blocks_per_die = (n->zone_capacity * lbasz)  / zns_stripe_size_bs;
     spp->register_model = spp_param->register_model;    
     /*Inho @ Temporarly, FEMU doesn't support more than 1 namespace. Parameters below is for supporting different zone configurations temporarly*/
 

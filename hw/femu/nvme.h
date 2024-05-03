@@ -1115,6 +1115,7 @@ typedef struct Oc12Ctrl Oc12Ctrl;
 
 typedef struct NvmeIdNsZoned NvmeIdNsZoned;
 typedef struct NvmeZone NvmeZone;
+typedef struct zns_vtable zns_vtable;
 
 typedef struct NvmeNamespace {
     struct FemuCtrl *ctrl;
@@ -1286,6 +1287,7 @@ typedef struct FemuCtrl {
     uint8_t         csi;
     NvmeIdNsZoned   *id_ns_zoned;
     NvmeZone        *zone_array;
+    zns_vtable      *zvtable;
     QTAILQ_HEAD(, NvmeZone) exp_open_zones;
     QTAILQ_HEAD(, NvmeZone) imp_open_zones;
     QTAILQ_HEAD(, NvmeZone) closed_zones;

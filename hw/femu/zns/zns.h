@@ -20,6 +20,8 @@ enum {
     ZONE_RESET_LATENCY =  3000000, // ns
 };
 
+typedef struct zns_vtable_entry;
+
 
 /**
  * @brief 
@@ -71,6 +73,7 @@ typedef struct zns {
     /* new members for znsssd */
     struct NvmeNamespace *namespaces;   // FEMU only support 1 namespace 
     struct NvmeZone *zone_array;
+    struct zns_vtable_entry *ventry;
     uint32_t num_zones;
     /* lockless ring for communication with NVMe IO thread */
 
@@ -195,6 +198,28 @@ typedef struct NvmeNamespaceParams {
     uint32_t max_open_zones;
     uint32_t zd_extension_size;
 } NvmeNamespaceParams;
+
+
+typedef enum VirtualZoneState {
+    NVME_VZONE_UNASSIGNED = 0x0,
+    NVME_VZONE_ACTIVE     = 0x1,
+    NVME_VZONE_INVALID    = 0x2,
+} VirtualZoneState;
+
+typedef struct zns_vtable_entry {
+    NvmeZone logical_zone;
+    NvmeZone *physical_zone;
+    uint8_t status;
+} zns_vtable_entry;
+
+typedef struct zns_vtable {
+    zns_vtable_entry* entries; 
+    int number_of_zones;
+
+    QTAILQ_HEAD(, NvmeZone) free_zones;
+    QTAILQ_HEAD(, NvmeZone) invalid_zones;
+    QTAILQ_HEAD(, NvmeZone) active_zones;
+} zns_vtable;
 
 static inline uint32_t zns_nsid(NvmeNamespace *ns)
 {

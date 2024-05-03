@@ -17,12 +17,23 @@ struct zns_zone_reset_ctx {
 
 static int zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req);
 
-static inline uint32_t zns_get_zone_idx(NvmeNamespace *ns, uint64_t slba)
+// Get the logical zone that the application sees
+static inline uint32_t zns_get_logical_zone_idx(NvmeNamespace *ns, uint64_t slba)
 {
     FemuCtrl *ctrl = ns->ctrl;
     return ctrl->zone_size_log2 > 0 ? slba >> ctrl->zone_size_log2 : slba / ctrl->zone_size;
 }
 
+// Get the internal zone assigned by our simple vtable
+static inline uint32_t zns_get_physical_zone_idx(NvmeNamespace *ns, uint64_t slba)
+{
+    uint32_t logical_zone_idx = zns_get_logical_zone_idx(ns, slba);
+    assert(ns->ctrl->zvtable->entries[logical_zone_idx].physical_zone);
+    uint64_t trueslba = ns->ctrl->zvtable->entries[logical_zone_idx].physical_zone->w_ptr;
+    return zns_get_logical_zone_idx(ns, trueslba);
+}
+
+// Get LUN of the address
 static inline uint64_t zns_get_ppn_idx(NvmeNamespace *ns, uint64_t slba) 
 {
     FemuCtrl *ctrl = ns->ctrl;
@@ -34,7 +45,7 @@ static inline uint64_t zns_get_ppn_idx(NvmeNamespace *ns, uint64_t slba)
     uint64_t ways = ssd_param->ways;
     uint64_t ways_per_zone = ssd_param->ways_per_zone;
     uint64_t planes_per_die = ssd_param->planes_per_die;
-    uint64_t zidx = zns_get_zone_idx(ns, slba);
+    uint64_t zidx = zns_get_physical_zone_idx(ns, slba);
     uint64_t slpa_origin = (slba >> 3) / ZNS_PAGE_PARALLELISM;
     uint64_t slpa = slpa_origin / planes_per_die;
 
@@ -59,15 +70,17 @@ static inline uint64_t zns_get_ppn_idx(NvmeNamespace *ns, uint64_t slba)
     return start + (iter_chnl_way * iter_chnl_way_val) + (iter_chnl * iter_chnl_val) + incre + increp;
 }
 
+// Get plane of the address
 static inline uint64_t zns_get_plane_idx(NvmeNamespace *ns, uint64_t slba)
 {
     FemuCtrl *n = ns->ctrl;
     struct zns *zns = n->zns;
     ZNSParams *ssd_param = &zns->sp;
-    uint64_t ppn = zns_get_ppn_idx(ns, slba);
+    uint64_t ppn = zns_get_physical_zone_idx(ns, slba);
     return ppn % (ssd_param->nchnls * ssd_param->ways * ssd_param->dies_per_chip * ssd_param->planes_per_die);
 }
 
+// Get chip of the address
 static inline uint64_t zns_get_chip_idx(NvmeNamespace *ns, uint64_t slba)
 {
     FemuCtrl *n = ns->ctrl;
@@ -75,7 +88,7 @@ static inline uint64_t zns_get_chip_idx(NvmeNamespace *ns, uint64_t slba)
     ZNSParams *ssd_param = &zns->sp;
     // Why is zidx not used here?
     // uint64_t zidx = zns_get_zone_idx(ns, slba);
-    uint64_t ppn = zns_get_ppn_idx(ns,slba);
+    uint64_t ppn = zns_get_physical_zone_idx(ns,slba);
     return (ppn / ssd_param->planes_per_die) % (ssd_param->nchnls * ssd_param->ways);
 }
 
@@ -97,9 +110,25 @@ static inline uint64_t zns_get_chnl_idx(NvmeNamespace *ns, uint64_t slba)
 static inline NvmeZone *zns_get_zone_by_slba(NvmeNamespace *ns, uint64_t slba)
 {
     FemuCtrl *n = ns->ctrl;
-    uint32_t zone_idx = zns_get_zone_idx(ns, slba);
+    uint32_t zone_idx = zns_get_logical_zone_idx(ns, slba);
     assert(zone_idx < n->num_zones);
-    return &n->zone_array[zone_idx];
+    return &n->zvtable->entries[zone_idx].logical_zone;
+}
+
+static inline NvmeZone *zns_get_physical_zone_by_slba(NvmeNamespace *ns, uint64_t slba)
+{
+    FemuCtrl *n = ns->ctrl;
+    uint32_t zone_idx = zns_get_logical_zone_idx(ns, slba);
+    assert(zone_idx < n->num_zones);
+    return n->zvtable->entries[zone_idx].physical_zone;
+}
+
+static inline zns_vtable_entry* zns_get_vtable_entry_by_slba(NvmeNamespace *ns, uint64_t slba)
+{
+    FemuCtrl *n = ns->ctrl;
+    uint32_t zone_idx = zns_get_logical_zone_idx(ns, slba);
+    assert(zone_idx < n->num_zones);
+    return &n->zvtable->entries[zone_idx];
 }
 
 static int zns_init_zone_geometry(NvmeNamespace *ns, Error **errp)
@@ -162,6 +191,21 @@ static int zns_init_zone_geometry(NvmeNamespace *ns, Error **errp)
     return 0;
 }
 
+static inline void set_zone_start(NvmeZone* zone, FemuCtrl *n, uint64_t start) {
+    zone->d.zt = NVME_ZONE_TYPE_SEQ_WRITE;
+
+#if MK_ZONE_CONVENTIONAL
+    if( (i & (UINT32_MAX << MK_ZONE_CONVENTIONAL)) == 0){
+        zone->d.zt = NVME_ZONE_TYPE_CONVENTIONAL;}
+#endif
+    zns_set_zone_state(zone, NVME_ZONE_STATE_EMPTY);
+    zone->d.za = 0;
+    zone->d.zcap = n->zone_capacity;
+    zone->d.zslba = start;
+    zone->d.wp = start;
+    zone->w_ptr = start;
+}
+
 static void zns_init_zoned_state(NvmeNamespace *ns)
 {
     FemuCtrl *n = ns->ctrl;
@@ -170,6 +214,16 @@ static void zns_init_zoned_state(NvmeNamespace *ns)
     NvmeZone *zone;
     uint32_t i;
     n->zone_array = g_new0(NvmeZone, n->num_zones);
+    
+    {
+        n->zvtable = g_malloc0(sizeof(struct zns_vtable));
+        n->zvtable->entries = g_new0(zns_vtable_entry, n->num_zones);
+        n->zvtable->number_of_zones = n->num_zones;
+        QTAILQ_INIT(&n->zvtable->free_zones);
+        QTAILQ_INIT(&n->zvtable->invalid_zones);
+        QTAILQ_INIT(&n->zvtable->active_zones);
+    }
+
     if (n->zd_extension_size) {
         n->zd_extensions = g_malloc0(n->zd_extension_size * n->num_zones);
     }
@@ -179,22 +233,23 @@ static void zns_init_zoned_state(NvmeNamespace *ns)
     QTAILQ_INIT(&n->closed_zones);
     QTAILQ_INIT(&n->full_zones);
 
+    // Physical zone
     zone = n->zone_array;
-    for (i = 0; i < n->num_zones; i++, zone++) {
+    struct zns_vtable_entry *ventry = n->zvtable->entries;
+    for (i = 0; i < n->num_zones; i++, zone++, ventry++) {
+        {
+            QTAILQ_INSERT_HEAD(&n->zvtable->free_zones, zone, entry);
+        }
+
         if (start + zone_size > capacity) {
             zone_size = capacity - start;
         }
-        zone->d.zt = NVME_ZONE_TYPE_SEQ_WRITE;
-#if MK_ZONE_CONVENTIONAL
-        if( (i & (UINT32_MAX << MK_ZONE_CONVENTIONAL)) == 0){
-            zone->d.zt = NVME_ZONE_TYPE_CONVENTIONAL;}
-#endif
-        zns_set_zone_state(zone, NVME_ZONE_STATE_EMPTY);
-        zone->d.za = 0;
-        zone->d.zcap = n->zone_capacity;
-        zone->d.zslba = start;
-        zone->d.wp = start;
-        zone->w_ptr = start;
+
+        set_zone_start(zone, n, start);
+        set_zone_start(&(ventry->logical_zone), n, start);
+        ventry->physical_zone = zone;
+        ventry->status = NVME_VZONE_UNASSIGNED;
+
         start += zone_size;
     }
 
@@ -244,6 +299,7 @@ static void  zns_init_zone_identify(FemuCtrl *n, NvmeNamespace *ns, int lba_inde
     n->id_ns_zoned = id_ns_z;
 }
 
+// TODO: @KD add vzone compatibility
 static void zns_clear_zone(NvmeNamespace *ns, NvmeZone *zone)
 {
     FemuCtrl *n = ns->ctrl;
@@ -305,6 +361,9 @@ void zns_ns_cleanup(NvmeNamespace *ns)
         g_free(n->id_ns_zoned);
         g_free(n->zone_array);
         g_free(n->zd_extensions);
+
+        g_free(n->zvtable->entries);
+        g_free(n->zvtable);
     }
 }
 
@@ -404,7 +463,7 @@ static uint16_t zns_check_zone_write(FemuCtrl *n, NvmeNamespace *ns,
                                       uint32_t nlb, bool append)
 {
     uint16_t status;
-    uint32_t zidx = zns_get_zone_idx(ns, slba);
+    uint32_t zidx = zns_get_logical_zone_idx(ns, slba);
     if (unlikely((slba + nlb) > zns_zone_wr_boundary(zone))) {
         status = NVME_ZONE_BOUNDARY_ERROR;
     } else {
@@ -469,12 +528,12 @@ static uint16_t zns_check_zone_read(NvmeNamespace *ns, uint64_t slba,
                                     uint32_t nlb)
 {
     FemuCtrl *n = ns->ctrl;
-    NvmeZone *zone = zns_get_zone_by_slba(ns, slba);
-    uint64_t bndry = zns_zone_rd_boundary(ns, zone);
+    NvmeZone *logical_zone = zns_get_zone_by_slba(ns, slba);
+    uint64_t bndry = zns_zone_rd_boundary(ns, logical_zone);
     uint64_t end = slba + nlb;
     uint16_t status;
 
-    status = zns_check_zone_state_for_read(zone);
+    status = zns_check_zone_state_for_read(logical_zone);
     if (status != NVME_SUCCESS) {
         ;
     } else if (unlikely(end > bndry)) {
@@ -487,12 +546,12 @@ static uint16_t zns_check_zone_read(NvmeNamespace *ns, uint64_t slba,
              * zones that are being read have an appropriate state.
              */
             do {
-                zone++;
-                status = zns_check_zone_state_for_read(zone);
+                logical_zone++;
+                status = zns_check_zone_state_for_read(logical_zone);
                 if (status != NVME_SUCCESS) {
                     break;
                 }
-            } while (end > zns_zone_rd_boundary(ns, zone));
+            } while (end > zns_zone_rd_boundary(ns, logical_zone));
         }
     }
 
@@ -511,15 +570,18 @@ static void zns_auto_transition_zone(NvmeNamespace *ns)
              /* Automatically close this implicitly open zone */
             QTAILQ_REMOVE(&n->imp_open_zones, zone, entry);
             zns_aor_dec_open(ns);
+            // TODO: @kd add vzone support
             zns_assign_zone_state(ns, zone, NVME_ZONE_STATE_CLOSED);
         }
     }
 }
 
-static uint16_t zns_auto_open_zone(NvmeNamespace *ns, NvmeZone *zone)
+// TODO: @kd add vzone support
+static uint16_t zns_auto_open_zone(NvmeNamespace *ns, zns_vtable_entry* ventry)
 {
+    NvmeZone* logical_zone = &ventry->logical_zone;
     uint16_t status = NVME_SUCCESS;
-    uint8_t zs = zns_get_zone_state(zone);
+    uint8_t zs = zns_get_zone_state(logical_zone);
 
     if (zs == NVME_ZONE_STATE_EMPTY) {
         zns_auto_transition_zone(ns);
@@ -536,23 +598,26 @@ static void zns_finalize_zoned_write(NvmeNamespace *ns, NvmeRequest *req,
                                      bool failed)
 {
     NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
-    NvmeZone *zone;
+    zns_vtable_entry *ventry;
     NvmeZonedResult *res = (NvmeZonedResult *)&req->cqe;
     uint64_t slba;
     uint32_t nlb;
 
     slba = le64_to_cpu(rw->slba);
     nlb = le16_to_cpu(rw->nlb) + 1;
-    zone = zns_get_zone_by_slba(ns, slba);
-    
-    zone->d.wp += nlb;
+    ventry = zns_get_vtable_entry_by_slba(ns, slba);
+    NvmeZone *logical_zone  = &ventry->logical_zone;
+    NvmeZone *physical_zone = ventry->physical_zone;
+
+    logical_zone->d.wp += nlb;
+    physical_zone->d.wp += nlb;
 
     if (failed) {
         res->slba = 0;
     }
 
-    if (zone->d.wp == zns_zone_wr_boundary(zone)) {
-        switch (zns_get_zone_state(zone)) {
+    if (logical_zone->d.wp == zns_zone_wr_boundary(logical_zone)) {
+        switch (zns_get_zone_state(logical_zone)) {
         case NVME_ZONE_STATE_IMPLICITLY_OPEN:
         case NVME_ZONE_STATE_EXPLICITLY_OPEN:
             zns_aor_dec_open(ns);
@@ -561,7 +626,8 @@ static void zns_finalize_zoned_write(NvmeNamespace *ns, NvmeRequest *req,
             zns_aor_dec_active(ns);
             /* fall through */
         case NVME_ZONE_STATE_EMPTY:
-            zns_assign_zone_state(ns, zone, NVME_ZONE_STATE_FULL);
+            zns_assign_zone_state(ns, logical_zone, NVME_ZONE_STATE_FULL);
+            zns_set_zone_state(physical_zone, NVME_ZONE_STATE_FULL);
             /* fall through */
         case NVME_ZONE_STATE_FULL:
             break;
@@ -571,29 +637,35 @@ static void zns_finalize_zoned_write(NvmeNamespace *ns, NvmeRequest *req,
     }
 }
 
-static uint64_t zns_advance_zone_wp(NvmeNamespace *ns, NvmeZone *zone,
+static uint64_t zns_advance_zone_wp(NvmeNamespace *ns, zns_vtable_entry *ventry,
                                     uint32_t nlb)
 {
-    uint64_t result = zone->w_ptr;
+    NvmeZone* logical_zone  = &ventry->logical_zone; 
+    NvmeZone* physical_zone = ventry->physical_zone; 
+
+    uint64_t result = logical_zone->w_ptr;
     uint8_t zs;
 
-    zone->w_ptr += nlb;
+    logical_zone->w_ptr += nlb;
+    physical_zone->w_ptr += nlb;
 
-    if (zone->w_ptr < zns_zone_wr_boundary(zone)) {
-        zs = zns_get_zone_state(zone);
+    if (logical_zone->w_ptr < zns_zone_wr_boundary(logical_zone)) {
+        zs = zns_get_zone_state(logical_zone);
         switch (zs) {
         case NVME_ZONE_STATE_EMPTY:
             zns_aor_inc_active(ns);
             /* fall through */
         case NVME_ZONE_STATE_CLOSED:
             zns_aor_inc_open(ns);
-            zns_assign_zone_state(ns, zone, NVME_ZONE_STATE_IMPLICITLY_OPEN);
+            zns_assign_zone_state(ns, logical_zone, NVME_ZONE_STATE_IMPLICITLY_OPEN);
+            zns_set_zone_state(physical_zone, NVME_ZONE_STATE_IMPLICITLY_OPEN);
         }
     }
 
     return result;
 }
 
+// Note that we do NOT set vzones here, this can be done at a later point in time
 static void zns_aio_zone_reset_cb(NvmeRequest *req, NvmeZone *zone)
 {
     NvmeNamespace *ns = req->ns;
@@ -628,6 +700,7 @@ enum NvmeZoneProcessingMask {
     NVME_PROC_FULL_ZONES      = 1 << 3,
 };
 
+// TODO: KD add assigning the physical_zone here
 static uint16_t zns_open_zone(NvmeNamespace *ns, NvmeZone *zone,
                               NvmeZoneState state, NvmeRequest *req)
 {
@@ -670,6 +743,8 @@ static uint16_t zns_close_zone(NvmeNamespace *ns, NvmeZone *zone,
     case NVME_ZONE_STATE_IMPLICITLY_OPEN:
         zns_aor_dec_open(ns);
         zns_assign_zone_state(ns, zone, NVME_ZONE_STATE_CLOSED);
+        NvmeZone* physical_zone = zns_get_physical_zone_by_slba(ns, zone->d.zslba);
+        zns_set_zone_state(physical_zone, NVME_ZONE_STATE_CLOSED);    
         /* fall through */
     case NVME_ZONE_STATE_CLOSED:
         return NVME_SUCCESS;
@@ -678,6 +753,7 @@ static uint16_t zns_close_zone(NvmeNamespace *ns, NvmeZone *zone,
     }
 }
 
+// TODO: KD add finish functionality
 static uint16_t zns_finish_zone(NvmeNamespace *ns, NvmeZone *zone,
                                 NvmeZoneState state, NvmeRequest *req)
 {
@@ -718,6 +794,7 @@ static uint16_t zns_reset_zone(NvmeNamespace *ns, NvmeZone *zone,
     }
 
     zns_aio_zone_reset_cb(req, zone);
+    // TODO: KD add physical zone to reset to reset queue
 
     return NVME_SUCCESS;
 }
@@ -728,6 +805,8 @@ static uint16_t zns_offline_zone(NvmeNamespace *ns, NvmeZone *zone,
     switch (state) {
     case NVME_ZONE_STATE_READ_ONLY:
         zns_assign_zone_state(ns, zone, NVME_ZONE_STATE_OFFLINE);
+        NvmeZone* physical_zone = zns_get_physical_zone_by_slba(ns, zone->d.zslba);
+        zns_set_zone_state(physical_zone, NVME_ZONE_STATE_OFFLINE);      
         /* fall through */
     case NVME_ZONE_STATE_OFFLINE:
         return NVME_SUCCESS;
@@ -852,7 +931,7 @@ out:
 }
 
 static uint16_t zns_get_mgmt_zone_slba_idx(FemuCtrl *n, NvmeCmd *c,
-                                           uint64_t *slba, uint32_t *zone_idx)
+                                           uint64_t *slba, uint32_t *logical_zone_idx, uint32_t *physical_zone_idx)
 {
     NvmeNamespace *ns = &n->namespaces[0];
     uint32_t dw10 = le32_to_cpu(c->cdw10);
@@ -868,12 +947,15 @@ static uint16_t zns_get_mgmt_zone_slba_idx(FemuCtrl *n, NvmeCmd *c,
         return NVME_LBA_RANGE | NVME_DNR;
     }
 
-    *zone_idx = zns_get_zone_idx(ns, *slba);
-    assert(*zone_idx < n->num_zones);
+    *logical_zone_idx = zns_get_logical_zone_idx(ns, *slba);
+    assert(*logical_zone_idx < n->num_zones);
+    *physical_zone_idx = zns_get_physical_zone_idx(ns, *slba);
+    assert(*physical_zone_idx < n->num_zones);
 
     return NVME_SUCCESS;
 }
 
+// TODO: KD transition to vzone here
 static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
 {
     NvmeCmd *cmd = (NvmeCmd *)&req->cmd;
@@ -885,7 +967,8 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
     uint8_t *zd_ext;
     uint32_t dw13 = le32_to_cpu(cmd->cdw13);
     uint64_t slba = 0;
-    uint32_t zone_idx = 0;
+    uint32_t logical_zone_idx = 0;
+    uint32_t physical_zone_idx = 0;
     uint16_t status;
     uint8_t action;
     bool all;
@@ -897,13 +980,14 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
     req->status = NVME_SUCCESS;
     //req->stime
     if (!all) {
-        status = zns_get_mgmt_zone_slba_idx(n, cmd, &slba, &zone_idx);
+        status = zns_get_mgmt_zone_slba_idx(n, cmd, &slba, &logical_zone_idx, &physical_zone_idx);
         if (status) {
             return status;
         }
     }
 
-    zone = &n->zone_array[zone_idx];
+    // zone = &n->zone_array[logical_zone_idx];
+    zone = &n->zvtable->entries[logical_zone_idx].logical_zone;
     if (slba != zone->d.zslba) {
         return NVME_INVALID_FIELD | NVME_DNR;
     }
@@ -950,7 +1034,7 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
         if (all || !n->zd_extension_size) {
             return NVME_INVALID_FIELD | NVME_DNR;
         }
-        zd_ext = zns_get_zd_extension(ns, zone_idx);
+        zd_ext = zns_get_zd_extension(ns, logical_zone_idx);
         status = dma_write_prp(n, (uint8_t *)zd_ext, n->zd_extension_size, prp1,
                                prp2);
         if (status) {
@@ -1007,7 +1091,7 @@ static uint16_t zns_zone_mgmt_recv(FemuCtrl *n, NvmeRequest *req)
     /* cdw12 is zero-based number of dwords to return. Convert to bytes */
     uint32_t data_size = (le32_to_cpu(cmd->cdw12) + 1) << 2;
     uint32_t dw13 = le32_to_cpu(cmd->cdw13);
-    uint32_t zone_idx, zra, zrasf, partial;
+    uint32_t logical_zone_idx, physical_zone_idx, zra, zrasf, partial;
     uint64_t max_zones, nr_zones = 0;
     uint16_t status;
     uint64_t slba, capacity = zns_ns_nlbas(ns);
@@ -1019,7 +1103,7 @@ static uint16_t zns_zone_mgmt_recv(FemuCtrl *n, NvmeRequest *req)
 
     req->status = NVME_SUCCESS;
 
-    status = zns_get_mgmt_zone_slba_idx(n, cmd, &slba, &zone_idx);
+    status = zns_get_mgmt_zone_slba_idx(n, cmd, &slba, &logical_zone_idx, &physical_zone_idx);
     if (status) {
         return status;
     }
@@ -1056,7 +1140,7 @@ static uint16_t zns_zone_mgmt_recv(FemuCtrl *n, NvmeRequest *req)
     max_zones = (data_size - sizeof(NvmeZoneReportHeader)) / zone_entry_sz;
     buf = g_malloc0(data_size);
 
-    zone = &n->zone_array[zone_idx];
+    zone = &n->zvtable->entries[logical_zone_idx].logical_zone;
     for (; slba < capacity; slba += n->zone_size) {
         if (partial && nr_zones >= max_zones) {
             break;
@@ -1069,8 +1153,8 @@ static uint16_t zns_zone_mgmt_recv(FemuCtrl *n, NvmeRequest *req)
     header->nr_zones = cpu_to_le64(nr_zones);
 
     buf_p = buf + sizeof(NvmeZoneReportHeader);
-    for (; zone_idx < n->num_zones && max_zones > 0; zone_idx++) {
-        zone = &n->zone_array[zone_idx];
+    for (; logical_zone_idx < n->num_zones && max_zones > 0; logical_zone_idx++) {
+        zone = &n->zvtable->entries[logical_zone_idx].logical_zone;
         if (zns_zone_matches_filter(zrasf, zone)) {
             z = (NvmeZoneDescr *)buf_p;
             buf_p += sizeof(NvmeZoneDescr);
@@ -1089,7 +1173,7 @@ static uint16_t zns_zone_mgmt_recv(FemuCtrl *n, NvmeRequest *req)
 
             if (zra == NVME_ZONE_REPORT_EXTENDED) {
                 if (zone->d.za & NVME_ZA_ZD_EXT_VALID) {
-                    memcpy(buf_p, zns_get_zd_extension(ns, zone_idx),
+                    memcpy(buf_p, zns_get_zd_extension(ns, logical_zone_idx),
                            n->zd_extension_size);
                 }
                 buf_p += n->zd_extension_size;
@@ -1143,7 +1227,7 @@ static uint16_t zns_map_dptr(FemuCtrl *n, size_t len, NvmeRequest *req)
     }
 }
 
-static uint16_t zns_do_write(FemuCtrl *n, NvmeRequest *req, bool append,
+static uint16_t zns_do_append(FemuCtrl *n, NvmeRequest *req, bool append,
                              bool wrz)
 {
     NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
@@ -1152,7 +1236,8 @@ static uint16_t zns_do_write(FemuCtrl *n, NvmeRequest *req, bool append,
     uint32_t nlb = (uint32_t)le16_to_cpu(rw->nlb) + 1;
     uint64_t data_size = zns_l2b(ns, nlb);
     uint64_t data_offset;
-    NvmeZone *zone;
+    NvmeZone *logical_zone;
+    zns_vtable_entry *ventry;
     NvmeZonedResult *res = (NvmeZonedResult *)&req->cqe;
     uint16_t status;
 
@@ -1171,23 +1256,24 @@ static uint16_t zns_do_write(FemuCtrl *n, NvmeRequest *req, bool append,
         goto err;
     }
 
-    zone = zns_get_zone_by_slba(ns, slba);
+    ventry = zns_get_vtable_entry_by_slba(ns, slba);
+    logical_zone = &ventry->logical_zone;
     //pthread_spin_lock(&zone->w_ptr_lock);
-    status = zns_check_zone_write(n, ns, zone, slba, nlb, append);
+    status = zns_check_zone_write(n, ns, logical_zone, slba, nlb, append);
 
     if (status) {
         goto err;
     }
 
-    status = zns_auto_open_zone(ns, zone);
+    status = zns_auto_open_zone(ns, ventry);
     if (status) {
         goto err;
     }
 
     if (append) {
-        slba = zone->w_ptr;
+        slba = logical_zone->w_ptr;
     }
-    res->slba = zns_advance_zone_wp(ns, zone, nlb);
+    res->slba = zns_advance_zone_wp(ns, ventry, nlb);
 
     data_offset = zns_l2b(ns, slba);
 
@@ -1223,7 +1309,7 @@ static uint16_t zns_admin_cmd(FemuCtrl *n, NvmeCmd *cmd)
 
 static inline uint16_t zns_zone_append(FemuCtrl *n, NvmeRequest *req)
 {
-    return zns_do_write(n, req, true, false);
+    return zns_do_append(n, req, true, false);
 }
 
 static uint16_t zns_check_dulbe(NvmeNamespace *ns, uint64_t slba, uint32_t nlb)
@@ -1231,7 +1317,7 @@ static uint16_t zns_check_dulbe(NvmeNamespace *ns, uint64_t slba, uint32_t nlb)
     return NVME_SUCCESS;
 }
 
-static uint64_t znsssd_write(ZNS *zns, NvmeRequest *req){
+static uint64_t zns_advance_status_write(ZNS *zns, NvmeRequest *req){
     //FEMU only supports 1 namespace for now (see femu.c:365)
     //and FEMU ZNS Extension use a single thread which mean lockless operations(ch->available_time += ~~) if thread increased
     NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
@@ -1298,7 +1384,7 @@ static uint64_t znsssd_write(ZNS *zns, NvmeRequest *req){
 
 }
 
-static uint64_t znsssd_read(ZNS *zns, NvmeRequest *req){
+static uint64_t zns_advance_status_read(ZNS *zns, NvmeRequest *req){
     // FEMU only supports 1 namespace for now (see femu.c:365) 
     // and FEMU ZNS Extension use a single thread which mean lockless operations(ch->available_time += ~~) if thread increased 
 
@@ -1375,17 +1461,13 @@ static uint64_t znsssd_read(ZNS *zns, NvmeRequest *req){
  * @param cmd 
  * @param req 
 }*/
-static uint64_t znssd_reset_zones(ZNS *zns, NvmeRequest *req){
+static uint64_t zns_advance_status_reset(ZNS *zns, NvmeRequest *req){
     NvmeCmd *cmd = (NvmeCmd *)&req->cmd;
     NvmeNamespace *ns = req->ns;
     FemuCtrl *n = ns->ctrl;
     ZNSParams * spp = &zns->sp;
-    //NvmeZone *zone;
-    uint32_t zone_idx = 0;
-    zns_ssd_lun *chip = NULL;
-    uint32_t chip_idx=0;
-    uint32_t chip_start_idx=0;
-    //zns_ssd_channel *chnl =NULL;
+    uint32_t logical_zone_idx = 0;
+    uint32_t physical_zone_idx = 0;
     zns_ssd_plane *plane = NULL;
 
     uint64_t slba = 0;
@@ -1393,44 +1475,26 @@ static uint64_t znssd_reset_zones(ZNS *zns, NvmeRequest *req){
 
     uint64_t maxlat = 0;
     uint64_t lat = 0;
-    //uint16_t status;
 
-    zns_get_mgmt_zone_slba_idx(n, cmd, &slba, &zone_idx);
-    n->zone_array[zone_idx].cnt_reset +=1;
-// #if SK_HYNIX_VALIDATION
-//     chip_idx = zone_idx % (spp->nchnls * spp->ways);
-//     chip = &(zns->chips[chip_idx]);
-//     chip->next_avail_time = (chip->next_avail_time > cmd_stime) ? 
-//         chip->next_avail_time + spp->blk_er_lat : cmd_stime + spp->blk_er_lat;
-//     return (chip->next_avail_time - cmd_stime);
-// #endif
-//     //default
-//     chip_start_idx = zone_idx % (spp->nchnls / spp->chnls_per_zone);
-//     chip_idx = chip_start_idx;
-//     n->zone_array[zone_idx].cnt_reset +=1;
-
-//     for(uint64_t ass=0; ass < spp->chnls_per_zone; ass++){
-//         for(uint64_t i =0 ; i < spp->ways ; i++){
-//             chip_idx += (i*spp->nchnls);
-//             chip = &(zns->chips[chip_idx]);
-//             chip->next_avail_time = chip->next_avail_time > cmd_stime ? 
-//                 chip->next_avail_time + spp->blk_er_lat : cmd_stime + spp->blk_er_lat;
-//             lat = chip->next_avail_time - cmd_stime;
-//             maxlat = (maxlat < lat) ? lat : maxlat;
-//         }
-//         chip_idx += 1; 
-//     }
+    // Update reset information for each zone
+    zns_get_mgmt_zone_slba_idx(n, cmd, &slba, &logical_zone_idx, &physical_zone_idx);
+    n->zvtable->entries[logical_zone_idx].logical_zone.cnt_reset   += 1;
+    n->zvtable->entries[logical_zone_idx].physical_zone->cnt_reset += 1;
 
     // Part of zone filled
-    NvmeZone *zone = &n->zone_array[zone_idx];
-    uint64_t filled = zone->w_ptr - zone->d.zslba;
-    if (!filled) {
-        return 0;
+    uint64_t blocks_to_erase = 0;
+    {
+        NvmeZone *physical_zone = n->zvtable->entries[logical_zone_idx].physical_zone;
+        uint64_t filled = physical_zone->w_ptr - physical_zone->d.zslba;
+        if (!filled) {
+            return 0;
+        }
+        uint64_t zone_chunk = n->zone_size / spp->blocks_per_die;
+        blocks_to_erase = spp->allow_partial_zone_resets ? (filled + zone_chunk - 1) / zone_chunk : spp->blocks_per_die;
+        physical_zone->w_ptr = physical_zone->d.zslba;
     }
-    uint64_t zone_chunk = n->zone_size / spp->blocks_per_die;
-    uint64_t blocks_to_erase = spp->allow_partial_zone_resets ? (filled + zone_chunk - 1) / zone_chunk : spp->blocks_per_die;
 
-    // Erase in chunks
+    // Erase blocks in chunks
     for (uint64_t b = 0; b < blocks_to_erase; b++) {
         // Get all associated planes
         for (int i = 0; i < spp->ways_per_zone * spp->chnls_per_zone; i++) {
@@ -1462,21 +1526,21 @@ static int zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, Nvme
     if (action == NVME_ZONE_ACTION_RESET){
         //reset zone->wp and zone->status=Empty
         //reset zone, causing every chip lat +
-        out = znssd_reset_zones(n->zns,req);
+        out = zns_advance_status_reset(n->zns,req);
         return out;
     }
     // Read, Write 
     assert(opcode == NVME_CMD_WRITE || opcode == NVME_CMD_READ || opcode == NVME_CMD_ZONE_APPEND);
     if(req->is_write) {
-        out = znsssd_write(n->zns, req);
+        out = zns_advance_status_write(n->zns, req);
     }
     else { 
-        out = znsssd_read(n->zns, req);
+        out = zns_advance_status_read(n->zns, req);
     }
     return out;
 }
 
-static uint16_t zns_read(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+static uint16_t zns_io_read(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
                          NvmeRequest *req)
 {
     NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
@@ -1508,14 +1572,12 @@ static uint16_t zns_read(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     }
 
     status = zns_check_zone_read(ns, slba, nlb);
-    
     if (status) {
         femu_err("zns_check_zone_read status %d %x\n",status,status);
         goto err;
     }
 
     status = zns_map_dptr(n, data_size, req);
-    
     if (status) {
         femu_err("zns_map_dptr status %d %x\n",status,status);
         goto err;
@@ -1565,7 +1627,7 @@ err:
 }
 
 
-static uint16_t zns_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+static uint16_t zns_io_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
                           NvmeRequest *req)
 {
     NvmeRwCmd *rw = (NvmeRwCmd *)cmd;
@@ -1573,10 +1635,11 @@ static uint16_t zns_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     uint32_t nlb = (uint32_t)le16_to_cpu(rw->nlb) + 1;
     uint64_t data_size = zns_l2b(ns, nlb);
     uint64_t data_offset;
-    NvmeZone *zone;
+    zns_vtable_entry* ventry;
+    NvmeZone *logical_zone;
     NvmeZonedResult *res = (NvmeZonedResult *)&req->cqe;
     uint16_t status;
-    uint64_t zidx = zns_get_zone_idx(ns, slba);
+    uint64_t zidx = zns_get_logical_zone_idx(ns, slba);
     uint64_t err_zidx = 0;
 
     assert(n->zoned);
@@ -1592,26 +1655,27 @@ static uint16_t zns_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         femu_err("zns check bounds [pid %x] slba : %lx , nlb : %x\n", getpid(), slba, nlb);
         goto err;
     }
-    zone = zns_get_zone_by_slba(ns, slba);
+    ventry = zns_get_vtable_entry_by_slba(ns, slba);
+    logical_zone = &ventry->logical_zone;
 
     //lock
     //pthread_spin_lock(&zone->w_ptr_lock);
-    status = zns_check_zone_write(n, ns, zone, slba, nlb, false);
+    status = zns_check_zone_write(n, ns, logical_zone, slba, nlb, false);
     //unlock
     if (status) {
         err_zidx = zidx;
-        femu_err("in zns_check_zone_write [pid %x] Zidx : %lx z.wtp : %lx , slba : %lx , nlb : %x\n", getpid() ,zidx, zone->w_ptr, slba, nlb);
+        femu_err("in zns_check_zone_write [pid %x] Zidx : %lx z.wtp : %lx , slba : %lx , nlb : %x\n", getpid() ,zidx, logical_zone->w_ptr, slba, nlb);
         goto err;
     }
     if(err_zidx > (1<<MK_ZONE_CONVENTIONAL)){
-        femu_err("in errzidx:%lx [pid %x] Zidx : %lx z.wtp : %lx , slba : %lx, nlb : %x \n", err_zidx, getpid() ,zidx, zone->w_ptr, slba, nlb);
+        femu_err("in errzidx:%lx [pid %x] Zidx : %lx z.wtp : %lx , slba : %lx, nlb : %x \n", err_zidx, getpid() ,zidx, logical_zone->w_ptr, slba, nlb);
     }
-    status = zns_auto_open_zone(ns, zone);
+    status = zns_auto_open_zone(ns, ventry);
     if (status) {
         goto err;
     }
     //lock
-    res->slba = zns_advance_zone_wp(ns, zone, nlb);
+    res->slba = zns_advance_zone_wp(ns, ventry, nlb);
     //unlock
     data_offset = zns_l2b(ns, slba);
     status = zns_map_dptr(n, data_size, req); // dptr:data pointer
@@ -1636,10 +1700,10 @@ static uint16_t zns_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     switch (cmd->opcode) {
     case NVME_CMD_READ:
         // femu_log("ZNS READ cmd->opcode %d %x\n",cmd->opcode, cmd->opcode);
-        return zns_read(n, ns, cmd, req);
+        return zns_io_read(n, ns, cmd, req);
     case NVME_CMD_WRITE:
         // femu_log("ZNS WRITE cmd->opcode %d %x\n",cmd->opcode, cmd->opcode);
-        return zns_write(n, ns, cmd, req);
+        return zns_io_write(n, ns, cmd, req);
     case NVME_CMD_ZONE_MGMT_SEND:
         return zns_zone_mgmt_send(n, req);
     case NVME_CMD_ZONE_MGMT_RECV:

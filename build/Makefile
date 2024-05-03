@@ -1,1 +1,0 @@
-/home/krijn/opt/ConfZNSplusplus/Makefile

@@ -76,7 +76,7 @@ static inline uint64_t zns_get_plane_idx(NvmeNamespace *ns, uint64_t slba)
     FemuCtrl *n = ns->ctrl;
     struct zns *zns = n->zns;
     ZNSParams *ssd_param = &zns->sp;
-    uint64_t ppn = zns_get_physical_zone_idx(ns, slba);
+    uint64_t ppn = zns_get_ppn_idx(ns, slba);
     return ppn % (ssd_param->nchnls * ssd_param->ways * ssd_param->dies_per_chip * ssd_param->planes_per_die);
 }
 
@@ -88,7 +88,7 @@ static inline uint64_t zns_get_chip_idx(NvmeNamespace *ns, uint64_t slba)
     ZNSParams *ssd_param = &zns->sp;
     // Why is zidx not used here?
     // uint64_t zidx = zns_get_zone_idx(ns, slba);
-    uint64_t ppn = zns_get_physical_zone_idx(ns,slba);
+    uint64_t ppn = zns_get_ppn_idx(ns,slba);
     return (ppn / ssd_param->planes_per_die) % (ssd_param->nchnls * ssd_param->ways);
 }
 
@@ -1557,7 +1557,10 @@ static uint64_t zns_advance_status_finish(ZNS *zns, NvmeRequest *req){
         return maxlat;
     }
 
-    // 1 MiB chunks are safe
+    // Direct blocking
+
+
+    // Chunk based
     slba = logical_zone->w_ptr;
     for (uint64_t i = 0; i < pages_to_write ; i += (ZNS_INTERNAL_PAGE_SIZE / 512)) {
         my_chnl_idx=zns_get_chnl_idx(ns, slba); 

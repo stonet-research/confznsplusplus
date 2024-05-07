@@ -3,12 +3,14 @@
 #include <signal.h>
 
 #define ZNS_EXTERNAL_PAGE_SIZE (4 * KiB)  // Exposed through NVMe
-#define ZNS_INTERNAL_PAGE_SIZE (16 * KiB) // Internal mapped size, the flash page size
+#define ZNS_INTERNAL_PAGE_SIZE (8 * KiB) // Internal mapped size, the flash page size
 #define ZNS_PAGE_PARALLELISM (ZNS_INTERNAL_PAGE_SIZE / ZNS_EXTERNAL_PAGE_SIZE) // How much parallel I/O fits in one flash page
-#define ZNS_ZASL_SIZE_BYTES (128 * KiB)
-#define ZNS_ZONE_SIZE_BYTES (64 * MiB)
+#define ZNS_ZASL_SIZE_BYTES (1 * MiB)
+#define ZNS_ZONE_SIZE_BYTES (2 * GiB)
 #define ZNS_ZONE_SIZE_PAGES (ZNS_ZONE_SIZE_BYTES / ZNS_INTERNAL_PAGE_SIZE)
+#define FINISH_BLOCK_SIZE ((ZNS_INTERNAL_PAGE_SIZE / 512ULL) * 64ULL)
 uint64_t lag = 0;
+uint64_t finishing = 0;
 
 struct zns_zone_reset_ctx {
     NvmeRequest *req;
@@ -1012,10 +1014,18 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
             proc_mask = NVME_PROC_OPENED_ZONES | NVME_PROC_CLOSED_ZONES;
         }
         req->expire_time += zns_advance_status(n, ns, cmd, req);
-        // femu_err("Finishing a zone at %lu\n", req->slba);
-        status = zns_do_zone_op(ns, zone, proc_mask, zns_finish_zone, req);
-        femu_err("zone finish action:%c slba:%ld zone_idx:%d req->expire_time(%lu) - req->stime(%lu):%lu\n",
-            action, req->slba ,logical_zone_idx,req->expire_time,req->stime,(req->expire_time - req->stime));
+        // femu_err("Finishing a zone at %u  %lu %lu / %lu\n", logical_zone_idx, zone->w_ptr, 
+        //     zone->d.zslba, zns_zone_wr_boundary(zone));
+        if (zone->w_ptr + FINISH_BLOCK_SIZE >= zns_zone_wr_boundary(zone) || zone->w_ptr == zone->d.zslba) {
+            // femu_err("Done finished\n");
+            status = zns_do_zone_op(ns, zone, proc_mask, zns_finish_zone, req);
+            cmd->cdw13 =  cpu_to_le32(le32_to_cpu(cmd->cdw13) | 0x100);
+        } else {
+            zone->w_ptr += FINISH_BLOCK_SIZE;
+            femu_err("zone->wptr %lu %lu\n", zone->w_ptr, FINISH_BLOCK_SIZE);
+        }
+        // femu_err("zone finish action:%c slba:%ld zone_idx:%d req->expire_time(%lu) - req->stime(%lu):%lu\n",
+        //    action, req->slba ,logical_zone_idx,req->expire_time,req->stime,(req->expire_time - req->stime));
         // femu_err("Finished a zone at %lu\n", req->slba);
         break;
     case NVME_ZONE_ACTION_RESET:
@@ -1356,8 +1366,8 @@ static uint64_t zns_advance_status_write(ZNS *zns, NvmeRequest *req){
         cmd_stime = req->stime;
     }
 
-    for (uint64_t i = 0; i < nlb ; i += (ZNS_INTERNAL_PAGE_SIZE / 512)) {
-        slba += i;
+    uint64_t step_size = (ZNS_INTERNAL_PAGE_SIZE / 512);
+    for (uint64_t i = 0; i < nlb ; i += step_size) {
 #if ADVANCE_PER_CH_ENDTIME
 #if SK_HYNIX_VALIDATION
         my_chnl_idx = hynix_zns_get_chnl_idx(ns, slba); // SK Hynix
@@ -1375,8 +1385,11 @@ static uint64_t zns_advance_status_write(ZNS *zns, NvmeRequest *req){
 #ifdef CONFZNS_DEBUG_LOG 
         femu_log("chnl [%u] status busy [%lu] from %lu to %lu [sqid %u] write", my_chnl_idx, qemu_clock_get_ns(QEMU_CLOCK_REALTIME), chnl_stime, chnl->next_ch_avail_time, req->sq->sqid);
 #endif
+        // femu_err("write %lu  %lu / %lu -> %lu \n", slba, i, nlb, my_plane_idx);
+
         //write: then do NAND program
-        //pthread_spin_lock(&(chip->time_lock)); 
+        //pthread_spin_lock(&(chip->time_lock));
+
         nand_stime = (plane->next_avail_time < chnl->next_ch_avail_time) ? chnl->next_ch_avail_time : plane->next_avail_time;
         plane->next_avail_time = nand_stime + spp->pg_wr_lat;
         currlat = plane->next_avail_time - cmd_stime;
@@ -1386,7 +1399,10 @@ static uint64_t zns_advance_status_write(ZNS *zns, NvmeRequest *req){
 #endif
         maxlat = (maxlat < currlat) ? currlat : maxlat;
 #endif
+        slba += step_size;
+        // femu_err("Lat2 %lu %lu %lu          %lu %lu\n", i, nlb, currlat, spp->pg_wr_lat, my_plane_idx);
     }
+    // femu_err("Write lat %lu %lu\n", slba, maxlat);
     return maxlat;
 
 }
@@ -1410,12 +1426,12 @@ static uint64_t zns_advance_status_read(ZNS *zns, NvmeRequest *req){
     zns_ssd_channel *chnl =NULL;
     uint32_t my_chnl_idx = 0;
     uint64_t chnl_stime =0;
+
     //uint64_t zidx= zns_get_zone_idx(ns, slba);
     //uint64_t slpa = (slba >> 3) / (ZNS_INTERNAL_PAGE_SIZE/ZNS_EXTERNAL_PAGE_SIZE);
     // 8:4K 32:16K 64:32K 128:64K
-    for (uint64_t i = 0; i < nlb; i += (ZNS_INTERNAL_PAGE_SIZE / 512)) {
-        slba += i;
-
+    uint64_t step_size = (ZNS_INTERNAL_PAGE_SIZE / 512);
+    for (uint64_t i = 0; i < nlb; i += step_size) {
         my_chnl_idx = zns_get_chnl_idx(ns, slba); 
         my_plane_idx = zns_get_plane_idx(ns, slba);
         chnl = &(zns->ch[my_chnl_idx]);
@@ -1455,6 +1471,7 @@ static uint64_t zns_advance_status_read(ZNS *zns, NvmeRequest *req){
         currlat = chnl->next_ch_avail_time - cmd_stime;
         maxlat = (maxlat < currlat)? currlat : maxlat;
         //femu_log("ztrace %lu zidx %lu slpa %lu cidx %u \n", qemu_clock_get_ns(QEMU_CLOCK_REALTIME), zidx, slpa, my_chip_idx);
+        slba += step_size;
     }
 
     return maxlat;
@@ -1507,8 +1524,8 @@ static uint64_t zns_advance_status_reset(ZNS *zns, NvmeRequest *req){
         for (int i = 0; i < spp->ways_per_zone * spp->chnls_per_zone; i++) {
             int step = i * (ZNS_INTERNAL_PAGE_SIZE / 512);
             uint64_t my_plane_idx = zns_get_plane_idx(ns, slba + step);
-            femu_err("DEBUG erasure: %lu %lu %lu %lu %lu %u\n", slba+step, zns_get_ppn_idx(ns, slba+step), my_plane_idx, 
-                (spp->ways * spp->planes_per_die* spp->dies_per_chip * spp->nchnls), b, spp->allow_partial_zone_resets);
+            // femu_err("DEBUG erasure: %lu %lu %lu %lu %lu %u\n", slba+step, zns_get_ppn_idx(ns, slba+step), my_plane_idx, 
+            //     (spp->ways * spp->planes_per_die* spp->dies_per_chip * spp->nchnls), b, spp->allow_partial_zone_resets);
             plane= &(zns->planes[my_plane_idx]);
             plane->next_avail_time = plane->next_avail_time > cmd_stime ? 
                     plane->next_avail_time + spp->blk_er_lat : cmd_stime + spp->blk_er_lat;
@@ -1538,12 +1555,18 @@ static uint64_t zns_advance_status_finish(ZNS *zns, NvmeRequest *req){
     uint64_t maxlat = 0;
     uint64_t lat = 0;
     uint64_t nand_stime = 0;
-    uint64_t chnl_stime = req->stime == 0 ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : req->stime;
+    uint64_t chnl_stime = 0;
+
+    finishing = 1;
+    finishing = 0;
 
     // Get pages to write
     zns_get_mgmt_zone_slba_idx(n, cmd, &slba, &logical_zone_idx, &physical_zone_idx);
     NvmeZone *logical_zone  = &n->zvtable->entries[logical_zone_idx].logical_zone;
     uint64_t pages_to_write = n->zone_capacity - (logical_zone->w_ptr - logical_zone->d.zslba);
+
+    pages_to_write = pages_to_write > FINISH_BLOCK_SIZE ? FINISH_BLOCK_SIZE : pages_to_write;
+
     // Nothing to write, but there is some RTT latency account for that
     if (!pages_to_write || pages_to_write == n->zone_capacity) {
         slba = logical_zone->w_ptr;
@@ -1559,16 +1582,17 @@ static uint64_t zns_advance_status_finish(ZNS *zns, NvmeRequest *req){
 
     // Direct blocking
 
-
     // Chunk based
     slba = logical_zone->w_ptr;
-    for (uint64_t i = 0; i < pages_to_write ; i += (ZNS_INTERNAL_PAGE_SIZE / 512)) {
+    uint64_t step_size = (ZNS_INTERNAL_PAGE_SIZE / 512);
+    for (uint64_t i = 0; i < pages_to_write ; i += step_size) {
         my_chnl_idx=zns_get_chnl_idx(ns, slba); 
         chnl = &(zns->ch[my_chnl_idx]);
         chnl_stime = (chnl->next_ch_avail_time < cmd_stime) ? cmd_stime : chnl->next_ch_avail_time;
         chnl->next_ch_avail_time = chnl_stime + spp->ch_xfer_lat;
 
         my_plane_idx = zns_get_plane_idx(ns, slba); 
+        // femu_err("Finish %lu  %lu / %lu -> %lu \n", slba, i, pages_to_write, my_plane_idx);
         plane= &(zns->planes[my_plane_idx]);
         nand_stime = (plane->next_avail_time < chnl->next_ch_avail_time) ? chnl->next_ch_avail_time : \
             plane->next_avail_time;
@@ -1576,6 +1600,8 @@ static uint64_t zns_advance_status_finish(ZNS *zns, NvmeRequest *req){
         lat = plane->next_avail_time - cmd_stime;
 
         maxlat = (maxlat < lat) ? lat : maxlat;
+
+        slba += step_size;
     }
 
     return maxlat;
@@ -1609,7 +1635,9 @@ static int zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, Nvme
         out = zns_advance_status_write(n->zns, req);
     }
     else { 
+        // femu_err("Going to read %u\n", finishing);
         out = zns_advance_status_read(n->zns, req);
+        // femu_err("Read %u\n", finishing);
     }
     return out;
 }
@@ -1897,7 +1925,7 @@ static void znsssd_init_params(FemuCtrl * n, ZNSParams *spp){
     femu_log("===========================================\n");
     femu_log("| nchnl       : %lu   | nway      : %lu   |\n", spp->nchnls, spp->ways);
     femu_log("| nchnl/zone  : %lu   | nway/zone : %lu   |\n", spp->chnls_per_zone, spp->ways_per_zone);
-    femu_log("| die/chip    : %lu   |           :       |\n", spp->dies_per_chip);
+    femu_log("| die/chip    : %lu   | io_qs     : %u    |\n", spp->dies_per_chip, n->num_io_queues);
     femu_log("| plane/die   : %lu   | block/die : %lu  |\n", spp->planes_per_die, spp->blocks_per_die);
     femu_log("| pages/block : %lu   |  stripe   : %lu   |\n", spp->block_size, zns_stripe_size_bs / ZNS_INTERNAL_PAGE_SIZE);
     femu_log("| page        : %ldKiB|  zones    : %lu  |\n", (ZNS_INTERNAL_PAGE_SIZE/KiB), spp->zones);

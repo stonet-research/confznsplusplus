@@ -1,6 +1,8 @@
 #include "./nvme.h"
 
 static uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req);
+static uint16_t nvme_io_cmd_post_process(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req);
+
 
 static void nvme_update_sq_eventidx(const NvmeSQueue *sq)
 {
@@ -65,6 +67,7 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
         req->expire_time = req->stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         req->cqe.cid = cmd.cid;
         req->cmd_opcode = cmd.opcode;
+        req->requeues = 0;
         //void *memcpy(void *dest, const void * src, size_t n)
         memcpy(&req->cmd, &cmd, sizeof(NvmeCmd));
 
@@ -156,6 +159,24 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
         cq = n->cq[req->sq->sqid];
         if (!cq->is_active)
             continue;
+       
+        NvmeCmd *cmd = (NvmeCmd *)&req->cmd;
+        uint32_t dw13 = le32_to_cpu(cmd->cdw13);
+        uint8_t action = dw13 & 0xff;
+        bool all = dw13 & 0x100;
+        if (action == 0x02) {
+            if (!all) {
+                req->expire_time = req->stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                nvme_io_cmd_post_process(n, cmd, req);
+                pqueue_pop(pq);
+                req->requeues++;
+                pqueue_insert( pq, req);
+                continue;
+            } else {
+                femu_err("Finish re-enqueue %d %lu\n", req->requeues, n->zone_cap_bs);
+            }
+        }
+       
         nvme_post_cqe(cq, req);
         QTAILQ_INSERT_TAIL(&req->sq->req_list, req, entry);
         pqueue_pop(pq);
@@ -625,6 +646,23 @@ static uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
         femu_err("%s, NVME_INVALID_OPCODE\n", __func__);
         return NVME_INVALID_OPCODE | NVME_DNR;
     }
+}
+
+static uint16_t nvme_io_cmd_post_process(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req) {
+    NvmeNamespace *ns;
+    uint32_t nsid = le32_to_cpu(cmd->nsid);
+
+    if (nsid == 0 || nsid > n->num_namespaces) {
+        femu_err("%s, NVME_INVALID_NSID %" PRIu32 "\n", __func__, nsid);
+        return NVME_INVALID_NSID | NVME_DNR;
+    }
+
+    if (n->ext_ops.io_cmd) {
+        return n->ext_ops.io_cmd(n, ns, cmd, req);
+    }
+
+    femu_err("%s, NVME_INVALID_OPCODE\n", __func__);
+    return NVME_INVALID_OPCODE | NVME_DNR;
 }
 
 void nvme_post_cqes_io(void *opaque)

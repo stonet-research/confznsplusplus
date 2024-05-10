@@ -216,9 +216,9 @@ typedef struct zns_vtable {
     zns_vtable_entry* entries; 
     int number_of_zones;
 
-    QTAILQ_HEAD(, NvmeZone) free_zones;
-    QTAILQ_HEAD(, NvmeZone) invalid_zones;
-    QTAILQ_HEAD(, NvmeZone) active_zones;
+    QTAILQ_HEAD(zns_free_zones_list, NvmeZone) free_zones;
+    QTAILQ_HEAD(zns_invalid_zones_list, NvmeZone) invalid_zones;
+    QTAILQ_HEAD(zns_active_zones_list, NvmeZone) active_zones;
 } zns_vtable;
 
 static inline uint32_t zns_nsid(NvmeNamespace *ns)

@@ -19,35 +19,6 @@ struct zns_zone_reset_ctx {
 
 static int zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req);
 
-static inline void zns_assign_physical_zone(FemuCtrl *n, zns_vtable_entry* ventry) {
-    struct zns *zns = n->zns; 
-    ZNSParams *spp = &zns->sp; 
-    NvmeZone *physical_zone;
-
-    if (spp->vtable_mode == 1 && ventry->status == NVME_VZONE_UNASSIGNED) {
-        // First check in free zones...
-        if (!QTAILQ_EMPTY(&n->zvtable->free_zones)) {
-            physical_zone = QTAILQ_FIRST(&n->zvtable->free_zones);
-            ventry->physical_zone = physical_zone;   
-            ventry->status = NVME_VZONE_ACTIVE;
-            QTAILQ_INSERT_TAIL(&n->zvtable->active_zones, physical_zone, entry);
-        }
-        // Then in used zones...
-        else if (!QTAILQ_EMPTY(&n->zvtable->invalid_zones)) {
-            physical_zone = QTAILQ_FIRST(&n->zvtable->invalid_zones);
-            ventry->physical_zone = physical_zone;   
-            ventry->status = NVME_VZONE_INVALID;
-            QTAILQ_INSERT_TAIL(&n->zvtable->active_zones, physical_zone, entry);
-        }
-        // if neither error
-        else {
-            femu_err("Fatal error assigning physical to virtual zone\n");
-            assert(false);
-        }
-    }
-    assert(ventry->physical_zone && ventry->status != NVME_VZONE_UNASSIGNED);
-}
-
 // Get the logical zone that the application sees
 static inline uint32_t zns_get_logical_zone_idx(NvmeNamespace *ns, uint64_t slba)
 {
@@ -59,7 +30,10 @@ static inline uint32_t zns_get_logical_zone_idx(NvmeNamespace *ns, uint64_t slba
 static inline uint32_t zns_get_physical_zone_idx(NvmeNamespace *ns, uint64_t slba)
 {
     uint32_t logical_zone_idx = zns_get_logical_zone_idx(ns, slba);
-    assert(ns->ctrl->zvtable->entries[logical_zone_idx].physical_zone);
+    if (ns->ctrl->zvtable->entries[logical_zone_idx].physical_zone == NULL) {
+        // femu_err("Get physical_idx when NULL\n");
+        return 0;
+    }
     uint64_t trueslba = ns->ctrl->zvtable->entries[logical_zone_idx].physical_zone->w_ptr;
     return zns_get_logical_zone_idx(ns, trueslba);
 }
@@ -162,6 +136,57 @@ static inline zns_vtable_entry* zns_get_vtable_entry_by_slba(NvmeNamespace *ns, 
     return &n->zvtable->entries[zone_idx];
 }
 
+static inline void zns_set_physical_zone(NvmeNamespace *ns, zns_vtable_entry *ventry, NvmeZone *zone) {
+    ventry->physical_zone = zone;
+    if (zone == NULL) {
+        femu_err("Set zone logical %lu (%lu)-> NULL \n", 
+            zns_get_logical_zone_idx(ns, ventry->logical_zone.d.zslba),
+            ventry->logical_zone.d.zslba);
+    } else {
+        femu_err("Set zone logical %lu (%lu)-> physical %lu (%lu)\n", 
+            zns_get_logical_zone_idx(ns, ventry->logical_zone.d.zslba),
+            ventry->logical_zone.d.zslba,
+            zns_get_logical_zone_idx(ns, ventry->physical_zone->d.zslba),
+            ventry->physical_zone->d.zslba);
+    }
+}
+
+
+static inline void zns_assign_physical_zone(FemuCtrl *n, zns_vtable_entry* ventry) {
+    struct zns *zns = n->zns; 
+    ZNSParams *spp = &zns->sp; 
+    NvmeZone *physical_zone, *zone, *next;
+
+    if (spp->vtable_mode == 1 && ventry->status == NVME_VZONE_UNASSIGNED) {
+        // First check in free zones...
+        if (!QTAILQ_EMPTY(&n->zvtable->free_zones)) {
+            femu_err("Found free zone \n");
+            physical_zone = QTAILQ_FIRST(&n->zvtable->free_zones);
+            zns_set_physical_zone(&n->namespaces[0], ventry, physical_zone);
+            ventry->physical_zone = physical_zone;   
+            ventry->status = NVME_VZONE_ACTIVE;
+            QTAILQ_REMOVE(&n->zvtable->free_zones, physical_zone, entry);
+            QTAILQ_INSERT_TAIL(&n->zvtable->active_zones, physical_zone, entry);
+        }
+        // Then in used zones...
+        else if (!QTAILQ_EMPTY(&n->zvtable->invalid_zones)) {
+            femu_err("Found invalid zone \n");
+            physical_zone = QTAILQ_FIRST(&n->zvtable->invalid_zones);
+            zns_set_physical_zone(&n->namespaces[0], ventry, physical_zone);
+            ventry->physical_zone = physical_zone;   
+            ventry->status = NVME_VZONE_INVALID;
+            QTAILQ_REMOVE(&n->zvtable->invalid_zones, physical_zone, entry);
+            QTAILQ_INSERT_TAIL(&n->zvtable->active_zones, physical_zone, entry);
+        }
+        // if neither error
+        else {
+            femu_err("Fatal error assigning physical to virtual zone\n");
+            assert(false);
+        }
+    }
+    assert(ventry->physical_zone && ventry->status != NVME_VZONE_UNASSIGNED);
+}
+
 static int zns_init_zone_geometry(NvmeNamespace *ns, Error **errp)
 {
     FemuCtrl *n = ns->ctrl;
@@ -245,18 +270,17 @@ static void zns_init_zoned_state(NvmeNamespace *ns)
     uint64_t start = 0, zone_size = n->zone_size;
     uint64_t capacity = n->num_zones * zone_size;
     NvmeZone *zone;
-    struct zns_vtable_entry *ventry = n->zvtable->entries;
+    struct zns_vtable_entry *ventry;
     uint32_t i;
     n->zone_array = g_new0(NvmeZone, n->num_zones);
     
-    {
-        n->zvtable = g_malloc0(sizeof(struct zns_vtable));
-        n->zvtable->entries = g_new0(zns_vtable_entry, n->num_zones);
-        n->zvtable->number_of_zones = n->num_zones;
-        QTAILQ_INIT(&n->zvtable->free_zones);
-        QTAILQ_INIT(&n->zvtable->invalid_zones);
-        QTAILQ_INIT(&n->zvtable->active_zones);
-    }
+    // Vtable
+    n->zvtable = g_malloc0(sizeof(struct zns_vtable));
+    n->zvtable->entries = g_new0(zns_vtable_entry, n->num_zones);
+    n->zvtable->number_of_zones = n->num_zones;
+    QTAILQ_INIT(&n->zvtable->free_zones);
+    QTAILQ_INIT(&n->zvtable->invalid_zones);
+    QTAILQ_INIT(&n->zvtable->active_zones);
 
     if (n->zd_extension_size) {
         n->zd_extensions = g_malloc0(n->zd_extension_size * n->num_zones);
@@ -267,10 +291,11 @@ static void zns_init_zoned_state(NvmeNamespace *ns)
     QTAILQ_INIT(&n->closed_zones);
     QTAILQ_INIT(&n->full_zones);
 
-
+    zone = n->zone_array;
+    ventry = n->zvtable->entries;
     for (i = 0; i < n->num_zones; i++, zone++, ventry++) {
         // All zone are active and will remain active
-        QTAILQ_INSERT_HEAD(&n->zvtable->active_zones, zone, entry);
+        QTAILQ_INSERT_TAIL(&n->zvtable->active_zones, zone, entry);
 
         if (start + zone_size > capacity) {
             zone_size = capacity - start;
@@ -1078,6 +1103,7 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
             physical_zone->w_ptr = physical_zone->d.zslba;
             n->zvtable->entries[logical_zone_idx].physical_zone->cnt_reset += 1;
         } else {
+            femu_err("Erasing zone %lu\n", logical_zone_idx);
             status = zns_do_zone_op(ns, logical_zone, proc_mask, zns_reset_zone, req);
             ventry = zns_get_vtable_entry_by_slba(ns, slba);
             // Mark as unused
@@ -1085,8 +1111,8 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
                 if (QTAILQ_IN_USE(physical_zone, entry)) {
                     QTAILQ_REMOVE(&n->zvtable->active_zones, physical_zone, entry);
                 }
-                QTAILQ_INSERT_TAIL(&n->zvtable->invalid_zones, physical_zone, entry);
-                ventry->physical_zone = NULL;
+                QTAILQ_INSERT_HEAD(&n->zvtable->invalid_zones, physical_zone, entry);
+                zns_set_physical_zone(&n->namespaces[0], ventry, NULL);
                 ventry->status = NVME_VZONE_UNASSIGNED;
             }
         }
@@ -1754,7 +1780,7 @@ static uint16_t zns_io_read(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
             goto err;
         }
     }
-    // femu_err("read success?? slba %lu\n",slba);
+    // femu_err("read success?? slba %lu %d\n",slba, ventry->status);
     data_offset = zns_l2b(ns, slba);
     // For now treat read to an inactive zone as a noop
     if (ventry->status == NVME_VZONE_ACTIVE) {
@@ -1826,7 +1852,6 @@ static uint16_t zns_io_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         goto err;
     }
 
-
     //lock
     //pthread_spin_lock(&zone->w_ptr_lock);
     status = zns_check_zone_write(n, ns, logical_zone, slba, nlb, false);
@@ -1846,7 +1871,9 @@ static uint16_t zns_io_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     // Erase invalidated zone..
     ZNSParams *spp = &zns->sp; 
     if (spp->vtable_mode == 1 && ventry->status == NVME_VZONE_INVALID) {
+        femu_err("Resetting physical zone first %lu\n", zidx);
         reqtime = zns_advance_status_reset_physical(req, zns, ventry->physical_zone);
+        ventry->physical_zone->w_ptr = ventry->physical_zone->d.zslba;
         ventry->status = NVME_VZONE_ACTIVE;
     }
 
@@ -1976,7 +2003,7 @@ static void zns_init_vtable(FemuCtrl * n, ZNSParams *spp) {
                 zone_size = capacity - start;
             }
 
-            ventry->physical_zone = zone;
+            zns_set_physical_zone(&n->namespaces[0], ventry, zone);
             ventry->status = NVME_VZONE_ACTIVE;
 
             start += zone_size;
@@ -1987,12 +2014,11 @@ static void zns_init_vtable(FemuCtrl * n, ZNSParams *spp) {
         for (i = 0; i < n->num_zones; i++, zone++, ventry++) {
             // All physical zone start out as INACTIVE
             QTAILQ_INSERT_HEAD(&n->zvtable->free_zones, zone, entry);
-
             if (start + zone_size > capacity) {
                 zone_size = capacity - start;
             }
 
-            ventry->physical_zone = NULL;
+            zns_set_physical_zone(&n->namespaces[0], ventry, NULL);
             ventry->status = NVME_VZONE_UNASSIGNED;
 
             start += zone_size;

@@ -1248,7 +1248,8 @@ typedef struct ZNSParams {
     uint64_t blocks_per_die;
     // erasure modes
     uint8_t allow_partial_zone_resets;
-    uint8_t asynchronous_resets; 
+    uint8_t asynchronous_resets;
+    uint8_t vtable_mode; 
     uint64_t zasl;
 } ZNSParams;
 

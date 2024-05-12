@@ -17,7 +17,7 @@ struct zns_zone_reset_ctx {
     NvmeZone    *zone;
 };
 
-static int zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req);
+static uint64_t zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req);
 
 // Get the logical zone that the application sees
 static inline uint32_t zns_get_logical_zone_idx(NvmeNamespace *ns, uint64_t slba)
@@ -171,7 +171,7 @@ static inline void zns_assign_physical_zone(FemuCtrl *n, zns_vtable_entry* ventr
         // Then in used zones...
         else if (!QTAILQ_EMPTY(&n->zvtable->invalid_zones)) {
             femu_err("Found invalid zone \n");
-            physical_zone = QTAILQ_FIRST(&n->zvtable->invalid_zones);
+            physical_zone = QTAILQ_LAST(&n->zvtable->invalid_zones);
             zns_set_physical_zone(&n->namespaces[0], ventry, physical_zone);
             ventry->physical_zone = physical_zone;   
             ventry->status = NVME_VZONE_INVALID;
@@ -1360,6 +1360,7 @@ static uint64_t zns_advance_status_reset_physical(NvmeRequest *req, ZNS *zns, Nv
                     plane->next_avail_time + spp->blk_er_lat : cmd_stime + spp->blk_er_lat;
             lat = plane->next_avail_time - cmd_stime;
             maxlat = (maxlat < lat) ? lat : maxlat;
+            femu_err("Erasure %lu %lu %lu --- %lu out of %lu\n", my_plane_idx, lat, maxlat, spp->blk_er_lat, blocks_to_erase);
         }
     }
     return maxlat;
@@ -1424,8 +1425,6 @@ static uint16_t zns_do_append(FemuCtrl *n, NvmeRequest *req, bool append,
     if (append) {
         slba = logical_zone->w_ptr;
     }
-    res->slba = zns_advance_zone_wp(ns, ventry, nlb);
-
     data_offset = zns_l2b(ns, slba);
 
     if (!wrz) {
@@ -1439,6 +1438,7 @@ static uint16_t zns_do_append(FemuCtrl *n, NvmeRequest *req, bool append,
         req->expire_time += reqtime;
         backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
     }
+    res->slba = zns_advance_zone_wp(ns, ventry, nlb);
     zns_finalize_zoned_write(ns, req, false);
     //pthread_spin_unlock(&zone->w_ptr_lock);
 
@@ -1521,13 +1521,13 @@ static uint64_t zns_advance_status_write(ZNS *zns, NvmeRequest *req){
         chnl->next_ch_avail_time = chnl_stime + spp->ch_xfer_lat;
         //pthread_spin_unlock(&(chnl->time_lock));
 
-        if (zone->w_ptr - zone->d.zslba < 64*4) {
-            femu_err("TESTINGA %lu %lu %lu  -- time %lu %li (idle %lu)", slba, my_chnl_idx, my_plane_idx, 
-                chnl_stime - cmd_stime, (plane->next_avail_time < cmd_stime) ? 0  : \
-                plane->next_avail_time - cmd_stime, 
-                (plane->next_avail_time < cmd_stime) ? cmd_stime - plane->next_avail_time  : \
-                0);
-        }
+        // if (zone->w_ptr - zone->d.zslba < 64*4) {
+        //     femu_err("TESTINGA %lu %lu %lu  -- time %lu %li (idle %lu)", slba, my_chnl_idx, my_plane_idx, 
+        //         chnl_stime - cmd_stime, (plane->next_avail_time < cmd_stime) ? 0  : \
+        //         plane->next_avail_time - cmd_stime, 
+        //         (plane->next_avail_time < cmd_stime) ? cmd_stime - plane->next_avail_time  : \
+        //         0);
+        // }
 
         nand_stime = (plane->next_avail_time < chnl->next_ch_avail_time) ? chnl->next_ch_avail_time : \
             plane->next_avail_time;
@@ -1536,16 +1536,20 @@ static uint64_t zns_advance_status_write(ZNS *zns, NvmeRequest *req){
         currlat = plane->next_avail_time - cmd_stime;
         maxlat = (maxlat < currlat) ? currlat : maxlat;
         
-        if (zone->w_ptr - zone->d.zslba < 64*4) {
-            femu_err(" %lu %lu TESTINGB %lu %lu \n?", currlat, maxlat, chnl->next_ch_avail_time - cmd_stime,
-                 plane->next_avail_time -cmd_stime);
-        }
+        // if (zone->w_ptr - zone->d.zslba < 64*4) {
+        //     femu_err(" %lu %lu TESTINGB %lu %lu \n?", currlat, maxlat, chnl->next_ch_avail_time - cmd_stime,
+        //          plane->next_avail_time -cmd_stime);
+        // }
         
         slba += step_size;
     }
 
     chnl = &(zns->ch[0]);
     pthread_spin_unlock(&(chnl->time_lock));
+
+    if (zone->w_ptr - zone->d.zslba < 1024) {
+        femu_err("Write lat %lu %lu\n", zone->w_ptr, maxlat);
+    }
 
     // femu_err("Write lat %lu %lu\n", slba, maxlat);
     return maxlat;
@@ -1691,7 +1695,7 @@ static uint64_t zns_advance_status_finish(ZNS *zns, NvmeRequest *req){
     return maxlat;
 }
 
-static int zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req){
+static uint64_t zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req){
     
     NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
     uint8_t opcode = rw->opcode;
@@ -1699,7 +1703,7 @@ static int zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, Nvme
 
     uint8_t action;
     action = dw13 & 0xff;
-    int out = 0;
+    uint64_t out = 0;
 
     // Zone Reset 
     if (action == NVME_ZONE_ACTION_RESET){
@@ -1870,25 +1874,30 @@ static uint16_t zns_io_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     }
     // Erase invalidated zone..
     ZNSParams *spp = &zns->sp; 
+    bool reset = false;
     if (spp->vtable_mode == 1 && ventry->status == NVME_VZONE_INVALID) {
         femu_err("Resetting physical zone first %lu\n", zidx);
         reqtime = zns_advance_status_reset_physical(req, zns, ventry->physical_zone);
         ventry->physical_zone->w_ptr = ventry->physical_zone->d.zslba;
         ventry->status = NVME_VZONE_ACTIVE;
+        reset = true;
     }
 
-    //lock
-    res->slba = zns_advance_zone_wp(ns, ventry, nlb);
-    //unlock
     data_offset = zns_l2b(ns, slba);
     status = zns_map_dptr(n, data_size, req); // dptr:data pointer
     if (status) {
         goto err;
     }
     tmpreqtime = zns_advance_status(n,ns,cmd,req);
+    if (reset) {
+        femu_err("Resetting physical zone time %lu %lu %lu\n", reqtime, tmpreqtime, tmpreqtime > reqtime ? tmpreqtime : reqtime);
+    }
     reqtime = tmpreqtime > reqtime ? tmpreqtime : reqtime;
     req->expire_time += reqtime;
     backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
+    //lock
+    res->slba = zns_advance_zone_wp(ns, ventry, nlb);
+    //unlock
     zns_finalize_zoned_write(ns, req, false);
     //pthread_spin_unlock(&zone->w_ptr_lock);
 

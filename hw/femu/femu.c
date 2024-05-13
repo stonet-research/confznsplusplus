@@ -758,6 +758,8 @@ static Property femu_props[] = {
     // ZNS modes
     DEFINE_PROP_UINT8("zns_allow_partial_resets", FemuCtrl, zns_params.allow_partial_zone_resets, 1),
     DEFINE_PROP_UINT8("zns_asynchronous_resets", FemuCtrl, zns_params.asynchronous_resets, 1),
+    // ZNS VTable mode (0 == direct, 1 == lazy)
+    DEFINE_PROP_UINT8("zns_vtable_mode", FemuCtrl, zns_params.vtable_mode, 0),
     // End
     DEFINE_PROP_END_OF_LIST(),
 };

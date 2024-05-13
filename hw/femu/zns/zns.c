@@ -3,19 +3,22 @@
 #include <signal.h>
 
 #define ZNS_EXTERNAL_PAGE_SIZE (4 * KiB)  // Exposed through NVMe
-#define ZNS_INTERNAL_PAGE_SIZE (16 * KiB) // Internal mapped size, the flash page size
+#define ZNS_INTERNAL_PAGE_SIZE (8 * KiB) // Internal mapped size, the flash page size
 #define ZNS_PAGE_PARALLELISM (ZNS_INTERNAL_PAGE_SIZE / ZNS_EXTERNAL_PAGE_SIZE) // How much parallel I/O fits in one flash page
-#define ZNS_ZASL_SIZE_BYTES (128 * KiB)
-#define ZNS_ZONE_SIZE_BYTES (64 * MiB)
+#define ZNS_ZASL_SIZE_BYTES (1 * MiB)
+#define ZNS_ZONE_SIZE_BYTES (2 * GiB)
 #define ZNS_ZONE_SIZE_PAGES (ZNS_ZONE_SIZE_BYTES / ZNS_INTERNAL_PAGE_SIZE)
+//#define FINISH_BLOCK_SIZE ((ZNS_INTERNAL_PAGE_SIZE / 512ULL) * 64ULL)
+#define FINISH_BLOCK_SIZE ((ZNS_INTERNAL_PAGE_SIZE / 512ULL) * 1ULL)
 uint64_t lag = 0;
+uint64_t finishing = 0;
 
 struct zns_zone_reset_ctx {
     NvmeRequest *req;
     NvmeZone    *zone;
 };
 
-static int zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req);
+static uint64_t zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req);
 
 // Get the logical zone that the application sees
 static inline uint32_t zns_get_logical_zone_idx(NvmeNamespace *ns, uint64_t slba)
@@ -28,7 +31,10 @@ static inline uint32_t zns_get_logical_zone_idx(NvmeNamespace *ns, uint64_t slba
 static inline uint32_t zns_get_physical_zone_idx(NvmeNamespace *ns, uint64_t slba)
 {
     uint32_t logical_zone_idx = zns_get_logical_zone_idx(ns, slba);
-    assert(ns->ctrl->zvtable->entries[logical_zone_idx].physical_zone);
+    if (ns->ctrl->zvtable->entries[logical_zone_idx].physical_zone == NULL) {
+        // femu_err("Get physical_idx when NULL\n");
+        return 0;
+    }
     uint64_t trueslba = ns->ctrl->zvtable->entries[logical_zone_idx].physical_zone->w_ptr;
     return zns_get_logical_zone_idx(ns, trueslba);
 }
@@ -131,6 +137,57 @@ static inline zns_vtable_entry* zns_get_vtable_entry_by_slba(NvmeNamespace *ns, 
     return &n->zvtable->entries[zone_idx];
 }
 
+static inline void zns_set_physical_zone(NvmeNamespace *ns, zns_vtable_entry *ventry, NvmeZone *zone) {
+    ventry->physical_zone = zone;
+    if (zone == NULL) {
+        femu_err("Set zone logical %lu (%lu)-> NULL \n", 
+            zns_get_logical_zone_idx(ns, ventry->logical_zone.d.zslba),
+            ventry->logical_zone.d.zslba);
+    } else {
+        femu_err("Set zone logical %lu (%lu)-> physical %lu (%lu)\n", 
+            zns_get_logical_zone_idx(ns, ventry->logical_zone.d.zslba),
+            ventry->logical_zone.d.zslba,
+            zns_get_logical_zone_idx(ns, ventry->physical_zone->d.zslba),
+            ventry->physical_zone->d.zslba);
+    }
+}
+
+
+static inline void zns_assign_physical_zone(FemuCtrl *n, zns_vtable_entry* ventry) {
+    struct zns *zns = n->zns; 
+    ZNSParams *spp = &zns->sp; 
+    NvmeZone *physical_zone, *zone, *next;
+
+    if (spp->vtable_mode == 1 && ventry->status == NVME_VZONE_UNASSIGNED) {
+        // First check in free zones...
+        if (!QTAILQ_EMPTY(&n->zvtable->free_zones)) {
+            femu_err("Found free zone \n");
+            physical_zone = QTAILQ_FIRST(&n->zvtable->free_zones);
+            zns_set_physical_zone(&n->namespaces[0], ventry, physical_zone);
+            ventry->physical_zone = physical_zone;   
+            ventry->status = NVME_VZONE_ACTIVE;
+            QTAILQ_REMOVE(&n->zvtable->free_zones, physical_zone, entry);
+            QTAILQ_INSERT_TAIL(&n->zvtable->active_zones, physical_zone, entry);
+        }
+        // Then in used zones...
+        else if (!QTAILQ_EMPTY(&n->zvtable->invalid_zones)) {
+            femu_err("Found invalid zone \n");
+            physical_zone = QTAILQ_LAST(&n->zvtable->invalid_zones);
+            zns_set_physical_zone(&n->namespaces[0], ventry, physical_zone);
+            ventry->physical_zone = physical_zone;   
+            ventry->status = NVME_VZONE_INVALID;
+            QTAILQ_REMOVE(&n->zvtable->invalid_zones, physical_zone, entry);
+            QTAILQ_INSERT_TAIL(&n->zvtable->active_zones, physical_zone, entry);
+        }
+        // if neither error
+        else {
+            femu_err("Fatal error assigning physical to virtual zone\n");
+            assert(false);
+        }
+    }
+    assert(ventry->physical_zone && ventry->status != NVME_VZONE_UNASSIGNED);
+}
+
 static int zns_init_zone_geometry(NvmeNamespace *ns, Error **errp)
 {
     FemuCtrl *n = ns->ctrl;
@@ -214,17 +271,17 @@ static void zns_init_zoned_state(NvmeNamespace *ns)
     uint64_t start = 0, zone_size = n->zone_size;
     uint64_t capacity = n->num_zones * zone_size;
     NvmeZone *zone;
+    struct zns_vtable_entry *ventry;
     uint32_t i;
     n->zone_array = g_new0(NvmeZone, n->num_zones);
     
-    {
-        n->zvtable = g_malloc0(sizeof(struct zns_vtable));
-        n->zvtable->entries = g_new0(zns_vtable_entry, n->num_zones);
-        n->zvtable->number_of_zones = n->num_zones;
-        QTAILQ_INIT(&n->zvtable->free_zones);
-        QTAILQ_INIT(&n->zvtable->invalid_zones);
-        QTAILQ_INIT(&n->zvtable->active_zones);
-    }
+    // Vtable
+    n->zvtable = g_malloc0(sizeof(struct zns_vtable));
+    n->zvtable->entries = g_new0(zns_vtable_entry, n->num_zones);
+    n->zvtable->number_of_zones = n->num_zones;
+    QTAILQ_INIT(&n->zvtable->free_zones);
+    QTAILQ_INIT(&n->zvtable->invalid_zones);
+    QTAILQ_INIT(&n->zvtable->active_zones);
 
     if (n->zd_extension_size) {
         n->zd_extensions = g_malloc0(n->zd_extension_size * n->num_zones);
@@ -235,13 +292,11 @@ static void zns_init_zoned_state(NvmeNamespace *ns)
     QTAILQ_INIT(&n->closed_zones);
     QTAILQ_INIT(&n->full_zones);
 
-    // Physical zone
     zone = n->zone_array;
-    struct zns_vtable_entry *ventry = n->zvtable->entries;
+    ventry = n->zvtable->entries;
     for (i = 0; i < n->num_zones; i++, zone++, ventry++) {
-        {
-            QTAILQ_INSERT_HEAD(&n->zvtable->free_zones, zone, entry);
-        }
+        // All zone are active and will remain active
+        QTAILQ_INSERT_TAIL(&n->zvtable->active_zones, zone, entry);
 
         if (start + zone_size > capacity) {
             zone_size = capacity - start;
@@ -249,8 +304,6 @@ static void zns_init_zoned_state(NvmeNamespace *ns)
 
         set_zone_start(zone, n, start);
         set_zone_start(&(ventry->logical_zone), n, start);
-        ventry->physical_zone = zone;
-        ventry->status = NVME_VZONE_UNASSIGNED;
 
         start += zone_size;
     }
@@ -960,11 +1013,13 @@ static uint16_t zns_get_mgmt_zone_slba_idx(FemuCtrl *n, NvmeCmd *c,
 // TODO: KD transition to vzone here
 static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
 {
+    struct zns *zns = n->zns;
+    ZNSParams *spp = &zns->sp; 
     NvmeCmd *cmd = (NvmeCmd *)&req->cmd;
     NvmeNamespace *ns = req->ns;
     uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
     uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
-    NvmeZone *zone;
+    NvmeZone *logical_zone, *physical_zone;
     uintptr_t *resets;
     uint8_t *zd_ext;
     uint32_t dw13 = le32_to_cpu(cmd->cdw13);
@@ -975,6 +1030,7 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
     uint8_t action;
     bool all;
     enum NvmeZoneProcessingMask proc_mask = NVME_PROC_CURRENT_ZONE;
+    zns_vtable_entry* ventry;
 
     action = dw13 & 0xff;
     all = dw13 & 0x100;
@@ -989,8 +1045,9 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
     }
 
     // zone = &n->zone_array[logical_zone_idx];
-    zone = &n->zvtable->entries[logical_zone_idx].logical_zone;
-    if (slba != zone->d.zslba) {
+    logical_zone = &n->zvtable->entries[logical_zone_idx].logical_zone;
+    physical_zone = n->zvtable->entries[logical_zone_idx].physical_zone;
+    if (slba != logical_zone->d.zslba) {
         return NVME_INVALID_FIELD | NVME_DNR;
     }
 
@@ -999,23 +1056,37 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
         if (all) {
             proc_mask = NVME_PROC_CLOSED_ZONES;
         }
-        status = zns_do_zone_op(ns, zone, proc_mask, zns_open_zone, req);
+        status = zns_do_zone_op(ns, logical_zone, proc_mask, zns_open_zone, req);
+        zns_set_zone_state(physical_zone, logical_zone->d.zs);
         break;
     case NVME_ZONE_ACTION_CLOSE:
         if (all) {
             proc_mask = NVME_PROC_OPENED_ZONES;
         }
-        status = zns_do_zone_op(ns, zone, proc_mask, zns_close_zone, req);
+        status = zns_do_zone_op(ns, logical_zone, proc_mask, zns_close_zone, req);
+        zns_set_zone_state(physical_zone, logical_zone->d.zs);
         break;
     case NVME_ZONE_ACTION_FINISH:
         if (all) {
             proc_mask = NVME_PROC_OPENED_ZONES | NVME_PROC_CLOSED_ZONES;
         }
         req->expire_time += zns_advance_status(n, ns, cmd, req);
-        // femu_err("Finishing a zone at %lu\n", req->slba);
-        status = zns_do_zone_op(ns, zone, proc_mask, zns_finish_zone, req);
-        femu_err("zone finish action:%c slba:%ld zone_idx:%d req->expire_time(%lu) - req->stime(%lu):%lu\n",
-            action, req->slba ,logical_zone_idx,req->expire_time,req->stime,(req->expire_time - req->stime));
+        // femu_err("Finishing a zone at %u  %lu %lu / %lu\n", logical_zone_idx, zone->w_ptr, 
+        //     zone->d.zslba, zns_zone_wr_boundary(zone));
+        if (logical_zone->w_ptr + FINISH_BLOCK_SIZE >= zns_zone_wr_boundary(logical_zone) || 
+            logical_zone->w_ptr == logical_zone->d.zslba) {
+            femu_err("Done finished\n");
+            status = zns_do_zone_op(ns, logical_zone, proc_mask, zns_finish_zone, req);
+            zns_set_zone_state(physical_zone, logical_zone->d.zs);
+            cmd->cdw13 =  cpu_to_le32(le32_to_cpu(cmd->cdw13) | 0x100);
+                    femu_err("Done finished?\n");
+        } else {
+            logical_zone->w_ptr += FINISH_BLOCK_SIZE;
+            physical_zone->w_ptr += FINISH_BLOCK_SIZE;
+            femu_err("zone->wptr %lu %lu %lu\n", logical_zone->w_ptr, physical_zone->w_ptr, FINISH_BLOCK_SIZE);
+        }
+        // femu_err("zone finish action:%c slba:%ld zone_idx:%d req->expire_time(%lu) - req->stime(%lu):%lu\n",
+        //    action, req->slba ,logical_zone_idx,req->expire_time,req->stime,(req->expire_time - req->stime));
         // femu_err("Finished a zone at %lu\n", req->slba);
         break;
     case NVME_ZONE_ACTION_RESET:
@@ -1026,8 +1097,30 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
                 NVME_PROC_FULL_ZONES;
         }
         *resets = 1;
-        req->expire_time += zns_advance_status(n, ns, cmd, req);
-        status = zns_do_zone_op(ns, zone, proc_mask, zns_reset_zone, req);
+
+        n->zvtable->entries[logical_zone_idx].logical_zone.cnt_reset += 1;
+        if (spp->vtable_mode == 0) {
+            req->expire_time += zns_advance_status(n, ns, cmd, req);
+            status = zns_do_zone_op(ns, logical_zone, proc_mask, zns_reset_zone, req);
+            zns_set_zone_state(physical_zone, logical_zone->d.zs);
+            logical_zone->w_ptr = physical_zone->w_ptr = physical_zone->d.zslba;
+            // femu_err("Reset %lu to %lu\n", logical_zone_idx, logical_zone->w_ptr);
+            n->zvtable->entries[logical_zone_idx].physical_zone->cnt_reset += 1;
+        } else {
+            femu_err("Erasing zone %lu\n", logical_zone_idx);
+            status = zns_do_zone_op(ns, logical_zone, proc_mask, zns_reset_zone, req);
+            ventry = zns_get_vtable_entry_by_slba(ns, slba);
+            // Mark as unused
+            if (physical_zone) {
+                if (QTAILQ_IN_USE(physical_zone, entry)) {
+                    QTAILQ_REMOVE(&n->zvtable->active_zones, physical_zone, entry);
+                }
+                QTAILQ_INSERT_HEAD(&n->zvtable->invalid_zones, physical_zone, entry);
+                zns_set_physical_zone(&n->namespaces[0], ventry, NULL);
+                ventry->status = NVME_VZONE_UNASSIGNED;
+            }
+        }
+
         (*resets)--;
         // femu_err("zone reset    action:%c   slba:%ld     zone_idx:%d    req->expire_time(%lu) - req->stime(%lu):%lu\n",action, req->slba ,zone_idx,req->expire_time,req->stime,(req->expire_time - req->stime));
         return NVME_SUCCESS;
@@ -1035,7 +1128,8 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
         if (all) {
             proc_mask = NVME_PROC_READ_ONLY_ZONES;
         }
-        status = zns_do_zone_op(ns, zone, proc_mask, zns_offline_zone, req);
+        status = zns_do_zone_op(ns, logical_zone, proc_mask, zns_offline_zone, req);
+        zns_set_zone_state(physical_zone, logical_zone->d.zs);
         break;
     case NVME_ZONE_ACTION_SET_ZD_EXT:
         if (all || !n->zd_extension_size) {
@@ -1047,7 +1141,7 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
         if (status) {
             return status;
         }
-        status = zns_set_zd_ext(ns, zone);
+        status = zns_set_zd_ext(ns, logical_zone);
         if (status == NVME_SUCCESS) {
             return status;
         }
@@ -1234,9 +1328,53 @@ static uint16_t zns_map_dptr(FemuCtrl *n, size_t len, NvmeRequest *req)
     }
 }
 
+static uint64_t zns_advance_status_reset_physical(NvmeRequest *req, ZNS *zns, NvmeZone *physical_zone) {
+    NvmeNamespace *ns = req->ns;
+    FemuCtrl *n = ns->ctrl;
+    ZNSParams * spp = &zns->sp;
+    zns_ssd_plane *plane = NULL;
+
+    uint64_t slba = physical_zone->d.zslba;
+    uint64_t cmd_stime = (req->stime == 0) ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : req->stime;
+
+    uint64_t maxlat = 0;
+    uint64_t lat = 0;
+
+    // Part of zone filled
+    uint64_t blocks_to_erase = 0;
+    {
+        uint64_t filled = physical_zone->w_ptr - physical_zone->d.zslba;
+        if (!filled) {
+            return maxlat;
+        }
+        uint64_t zone_chunk = n->zone_capacity / spp->blocks_per_die;
+        blocks_to_erase = spp->allow_partial_zone_resets ? (filled + zone_chunk - 1) / zone_chunk : spp->blocks_per_die;
+    }
+
+    // Erase blocks in chunks
+    for (uint64_t b = 0; b < blocks_to_erase; b++) {
+        // Get all associated planes
+        for (int i = 0; i < spp->ways_per_zone * spp->chnls_per_zone; i++) {
+            int step = i * (ZNS_INTERNAL_PAGE_SIZE / 512);
+            uint64_t my_plane_idx = zns_get_plane_idx(ns, slba + step);
+            // femu_err("DEBUG erasure: %lu %lu %lu %lu %lu %u\n", slba+step, zns_get_ppn_idx(ns, slba+step), my_plane_idx, 
+            //     (spp->ways * spp->planes_per_die* spp->dies_per_chip * spp->nchnls), b, spp->allow_partial_zone_resets);
+            plane= &(zns->planes[my_plane_idx]);
+            plane->next_avail_time = plane->next_avail_time > cmd_stime ? 
+                    plane->next_avail_time + spp->blk_er_lat : cmd_stime + spp->blk_er_lat;
+            lat = plane->next_avail_time - cmd_stime;
+            maxlat = (maxlat < lat) ? lat : maxlat;
+            femu_err("Erasure %lu %lu %lu --- %lu out of %lu\n", my_plane_idx, lat, maxlat, spp->blk_er_lat, blocks_to_erase);
+        }
+    }
+    return maxlat;
+}
+
+
 static uint16_t zns_do_append(FemuCtrl *n, NvmeRequest *req, bool append,
                              bool wrz)
 {
+    struct zns *zns = n->zns;
     NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
     NvmeNamespace *ns = req->ns;
     uint64_t slba = le64_to_cpu(rw->slba);
@@ -1247,9 +1385,15 @@ static uint16_t zns_do_append(FemuCtrl *n, NvmeRequest *req, bool append,
     zns_vtable_entry *ventry;
     NvmeZonedResult *res = (NvmeZonedResult *)&req->cqe;
     uint16_t status;
+    uint64_t reqtime = 0, tmpreqtime = 0;
 
     assert(n->zoned);
     req->is_write = true;
+
+    ventry = zns_get_vtable_entry_by_slba(ns, slba);
+    logical_zone = &ventry->logical_zone;
+    // Assign new zone?
+    zns_assign_physical_zone(n, ventry);
 
     if (!wrz) {
         status = nvme_check_mdts(n, data_size);
@@ -1263,8 +1407,6 @@ static uint16_t zns_do_append(FemuCtrl *n, NvmeRequest *req, bool append,
         goto err;
     }
 
-    ventry = zns_get_vtable_entry_by_slba(ns, slba);
-    logical_zone = &ventry->logical_zone;
     //pthread_spin_lock(&zone->w_ptr_lock);
     status = zns_check_zone_write(n, ns, logical_zone, slba, nlb, append);
 
@@ -1277,11 +1419,16 @@ static uint16_t zns_do_append(FemuCtrl *n, NvmeRequest *req, bool append,
         goto err;
     }
 
+    // Erase invalidated zone..
+    ZNSParams *spp = &zns->sp; 
+    if (spp->vtable_mode == 1 && ventry->status == NVME_VZONE_INVALID) {
+        reqtime = zns_advance_status_reset_physical(req, zns, ventry->physical_zone);
+        ventry->status = NVME_VZONE_ACTIVE;
+    }
+
     if (append) {
         slba = logical_zone->w_ptr;
     }
-    res->slba = zns_advance_zone_wp(ns, ventry, nlb);
-
     data_offset = zns_l2b(ns, slba);
 
     if (!wrz) {
@@ -1290,9 +1437,12 @@ static uint16_t zns_do_append(FemuCtrl *n, NvmeRequest *req, bool append,
             goto err;
         }
         
-        req->expire_time += zns_advance_status(n,ns,&req->cmd,req);
+        tmpreqtime = zns_advance_status(n,ns,(NvmeCmd *)&req->cmd,req);
+        reqtime = tmpreqtime > reqtime ? tmpreqtime : reqtime;
+        req->expire_time += reqtime;
         backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
     }
+    res->slba = zns_advance_zone_wp(ns, ventry, nlb);
     zns_finalize_zoned_write(ns, req, false);
     //pthread_spin_unlock(&zone->w_ptr_lock);
 
@@ -1333,18 +1483,23 @@ static uint64_t zns_advance_status_write(ZNS *zns, NvmeRequest *req){
     uint64_t slba = le64_to_cpu(rw->slba);
     uint32_t nlb = (uint32_t)le16_to_cpu(rw->nlb) + 1;
     uint64_t currlat = 0, maxlat = 0;
+    zns_ssd_channel *chnl = NULL;
+    zns_ssd_plane *plane = NULL;
+
+    chnl = &(zns->ch[0]);
+    pthread_spin_lock(&(chnl->time_lock));
+
 
     // To get accurate append latency we need to change the slba to the zone pointer (we do not send all requests to slba even for appends).
-    {
         NvmeZone *zone;
+    {
         zone = zns_get_zone_by_slba(ns, slba);
         slba = zone->w_ptr;
     }
 
     uint64_t nand_stime = 0;
     uint64_t cmd_stime = 0;
-    zns_ssd_channel *chnl = NULL;
-    zns_ssd_plane *plane = NULL;
+
     uint32_t my_plane_idx = 0;
     uint32_t my_chnl_idx = 0;
     uint64_t chnl_stime = req->stime == 0 ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : req->stime;
@@ -1356,37 +1511,51 @@ static uint64_t zns_advance_status_write(ZNS *zns, NvmeRequest *req){
         cmd_stime = req->stime;
     }
 
-    for (uint64_t i = 0; i < nlb ; i += (ZNS_INTERNAL_PAGE_SIZE / 512)) {
-        slba += i;
-#if ADVANCE_PER_CH_ENDTIME
-#if SK_HYNIX_VALIDATION
-        my_chnl_idx = hynix_zns_get_chnl_idx(ns, slba); // SK Hynix
-#endif
-#if !(SK_HYNIX_VALIDATION)
+    uint64_t step_size = (ZNS_INTERNAL_PAGE_SIZE / 512);
+    for (uint64_t i = 0; i < nlb ; i += step_size) {
         my_chnl_idx=zns_get_chnl_idx(ns, slba); 
-#endif
         my_plane_idx = zns_get_plane_idx(ns, slba); 
+
         chnl = &(zns->ch[my_chnl_idx]);
         plane= &(zns->planes[my_plane_idx]);
+
         //pthread_spin_lock(&(chnl->time_lock));
-        chnl_stime = (chnl->next_ch_avail_time < cmd_stime) ? cmd_stime : chnl->next_ch_avail_time;
+        chnl_stime = (chnl->next_ch_avail_time < cmd_stime) ? \
+            cmd_stime : chnl->next_ch_avail_time;
         chnl->next_ch_avail_time = chnl_stime + spp->ch_xfer_lat;
         //pthread_spin_unlock(&(chnl->time_lock));
-#ifdef CONFZNS_DEBUG_LOG 
-        femu_log("chnl [%u] status busy [%lu] from %lu to %lu [sqid %u] write", my_chnl_idx, qemu_clock_get_ns(QEMU_CLOCK_REALTIME), chnl_stime, chnl->next_ch_avail_time, req->sq->sqid);
-#endif
-        //write: then do NAND program
-        //pthread_spin_lock(&(chip->time_lock)); 
-        nand_stime = (plane->next_avail_time < chnl->next_ch_avail_time) ? chnl->next_ch_avail_time : plane->next_avail_time;
+
+        // if (zone->w_ptr - zone->d.zslba < 64*4) {
+        //     femu_err("TESTINGA %lu %lu %lu  -- time %lu %li (idle %lu)", slba, my_chnl_idx, my_plane_idx, 
+        //         chnl_stime - cmd_stime, (plane->next_avail_time < cmd_stime) ? 0  : \
+        //         plane->next_avail_time - cmd_stime, 
+        //         (plane->next_avail_time < cmd_stime) ? cmd_stime - plane->next_avail_time  : \
+        //         0);
+        // }
+
+        nand_stime = (plane->next_avail_time < chnl->next_ch_avail_time) ? chnl->next_ch_avail_time : \
+            plane->next_avail_time;
         plane->next_avail_time = nand_stime + spp->pg_wr_lat;
+        
         currlat = plane->next_avail_time - cmd_stime;
-        //pthread_spin_unlock(&(chip->time_lock));
-#ifdef CONFZNS_DEBUG_LOG 
-        femu_log("plane [%u] status busy [%lu] from %lu to %lu [sqid %u] write\n", my_plane_idx, qemu_clock_get_ns(QEMU_CLOCK_REALTIME), nand_stime, plane->next_avail_time, req->sq->sqid );
-#endif
         maxlat = (maxlat < currlat) ? currlat : maxlat;
-#endif
+        
+        // if (zone->w_ptr - zone->d.zslba < 64*4) {
+        //     femu_err(" %lu %lu TESTINGB %lu %lu \n?", currlat, maxlat, chnl->next_ch_avail_time - cmd_stime,
+        //          plane->next_avail_time -cmd_stime);
+        // }
+        
+        slba += step_size;
     }
+
+    chnl = &(zns->ch[0]);
+    pthread_spin_unlock(&(chnl->time_lock));
+
+    if (zone->w_ptr - zone->d.zslba < 1024) {
+        // femu_err("Write lat %lu %lu\n", zone->w_ptr, maxlat);
+    }
+
+    // femu_err("Write lat %lu %lu\n", slba, maxlat);
     return maxlat;
 
 }
@@ -1410,51 +1579,29 @@ static uint64_t zns_advance_status_read(ZNS *zns, NvmeRequest *req){
     zns_ssd_channel *chnl =NULL;
     uint32_t my_chnl_idx = 0;
     uint64_t chnl_stime =0;
+
     //uint64_t zidx= zns_get_zone_idx(ns, slba);
     //uint64_t slpa = (slba >> 3) / (ZNS_INTERNAL_PAGE_SIZE/ZNS_EXTERNAL_PAGE_SIZE);
     // 8:4K 32:16K 64:32K 128:64K
-    for (uint64_t i = 0; i < nlb; i += (ZNS_INTERNAL_PAGE_SIZE / 512)) {
-        slba += i;
-
+    uint64_t step_size = (ZNS_INTERNAL_PAGE_SIZE / 512);
+    for (uint64_t i = 0; i < nlb; i += step_size) {
         my_chnl_idx = zns_get_chnl_idx(ns, slba); 
         my_plane_idx = zns_get_plane_idx(ns, slba);
         chnl = &(zns->ch[my_chnl_idx]);
         plane= &(zns->planes[my_plane_idx]);
 
         //Inhoinno:  Single thread emulation so assume we dont need lock per chnl
-        //pthread_spin_lock(&(chip->time_lock));
-        //GET PLANE AVAILABLE TIME
         nand_stime = (plane->next_avail_time < cmd_stime) ? cmd_stime : \
                      plane->next_avail_time;
-        //pthread_spin_unlock(&(chip->time_lock));
-        //NAND READ OPERATION HERE
-        //pthread_spin_lock(&(chip->time_lock));
         plane->next_avail_time = nand_stime + spp->pg_rd_lat;
-        //pthread_spin_unlock(&(chip->time_lock));
 
-        //read: then data transfer through channel
-        //pthread_spin_lock(&(chnl->time_lock));
         chnl_stime = (chnl->next_ch_avail_time < plane->next_avail_time) ? \
             plane->next_avail_time : chnl->next_ch_avail_time;
         chnl->next_ch_avail_time = chnl_stime + spp->ch_xfer_lat;
-        //IF REGISTER IS AVAIL THEN = 
-        //ELSE REGISTER IS FULL THEN PLANE NEXT AVAIL TIME = chnl->next_ch_avail_time
-        //pthread_spin_unlock(&(chnl->time_lock));
 
-        //if register full in plane i 
-        //      then plane->next_avail_time = chnl->next_ch_avail_time
-        //      
-        //else if register is not full 
-
-        //femu_log("chnl %u status busy [%lu] from %lu to %lu ", my_chnl_idx, qemu_clock_get_ns(QEMU_CLOCK_REALTIME),chnl_stime, chnl->next_ch_avail_time);
-        //femu_log("chip [%u] status busy from %lu to %lu (r)\n", my_chip_idx, nand_stime,chip->next_avail_time );
-#ifdef CONFZNS_DEBUG_LOG 
-        femu_log("chnl [%u] status busy [%lu] from %lu to %lu [sqid %u] read", my_chnl_idx, qemu_clock_get_ns(QEMU_CLOCK_REALTIME), chnl_stime, chnl->next_ch_avail_time, req->sq->sqid);
-        femu_log("plane [%u] status busy [%lu] from %lu to %lu [sqid %u] read\n", my_plane_idx, qemu_clock_get_ns(QEMU_CLOCK_REALTIME), nand_stime, plane->next_avail_time,req->sq->sqid );
-#endif
         currlat = chnl->next_ch_avail_time - cmd_stime;
         maxlat = (maxlat < currlat)? currlat : maxlat;
-        //femu_log("ztrace %lu zidx %lu slpa %lu cidx %u \n", qemu_clock_get_ns(QEMU_CLOCK_REALTIME), zidx, slpa, my_chip_idx);
+        slba += step_size;
     }
 
     return maxlat;
@@ -1472,51 +1619,13 @@ static uint64_t zns_advance_status_reset(ZNS *zns, NvmeRequest *req){
     NvmeCmd *cmd = (NvmeCmd *)&req->cmd;
     NvmeNamespace *ns = req->ns;
     FemuCtrl *n = ns->ctrl;
-    ZNSParams * spp = &zns->sp;
     uint32_t logical_zone_idx = 0;
     uint32_t physical_zone_idx = 0;
-    zns_ssd_plane *plane = NULL;
-
     uint64_t slba = 0;
-    uint64_t cmd_stime = (req->stime == 0) ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : req->stime;
 
-    uint64_t maxlat = 0;
-    uint64_t lat = 0;
-
-    // Update reset information for each zone
     zns_get_mgmt_zone_slba_idx(n, cmd, &slba, &logical_zone_idx, &physical_zone_idx);
-    n->zvtable->entries[logical_zone_idx].logical_zone.cnt_reset   += 1;
-    n->zvtable->entries[logical_zone_idx].physical_zone->cnt_reset += 1;
 
-    // Part of zone filled
-    uint64_t blocks_to_erase = 0;
-    {
-        NvmeZone *physical_zone = n->zvtable->entries[logical_zone_idx].physical_zone;
-        uint64_t filled = physical_zone->w_ptr - physical_zone->d.zslba;
-        if (!filled) {
-            return maxlat;
-        }
-        uint64_t zone_chunk = n->zone_capacity / spp->blocks_per_die;
-        blocks_to_erase = spp->allow_partial_zone_resets ? (filled + zone_chunk - 1) / zone_chunk : spp->blocks_per_die;
-        physical_zone->w_ptr = physical_zone->d.zslba;
-    }
-
-    // Erase blocks in chunks
-    for (uint64_t b = 0; b < blocks_to_erase; b++) {
-        // Get all associated planes
-        for (int i = 0; i < spp->ways_per_zone * spp->chnls_per_zone; i++) {
-            int step = i * (ZNS_INTERNAL_PAGE_SIZE / 512);
-            uint64_t my_plane_idx = zns_get_plane_idx(ns, slba + step);
-            femu_err("DEBUG erasure: %lu %lu %lu %lu %lu %u\n", slba+step, zns_get_ppn_idx(ns, slba+step), my_plane_idx, 
-                (spp->ways * spp->planes_per_die* spp->dies_per_chip * spp->nchnls), b, spp->allow_partial_zone_resets);
-            plane= &(zns->planes[my_plane_idx]);
-            plane->next_avail_time = plane->next_avail_time > cmd_stime ? 
-                    plane->next_avail_time + spp->blk_er_lat : cmd_stime + spp->blk_er_lat;
-            lat = plane->next_avail_time - cmd_stime;
-            maxlat = (maxlat < lat) ? lat : maxlat;
-        }
-    }
-    return maxlat;
+    return zns_advance_status_reset_physical(req, zns, n->zvtable->entries[logical_zone_idx].physical_zone);
 }
 
 static uint64_t zns_advance_status_finish(ZNS *zns, NvmeRequest *req){
@@ -1538,12 +1647,18 @@ static uint64_t zns_advance_status_finish(ZNS *zns, NvmeRequest *req){
     uint64_t maxlat = 0;
     uint64_t lat = 0;
     uint64_t nand_stime = 0;
-    uint64_t chnl_stime = req->stime == 0 ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : req->stime;
+    uint64_t chnl_stime = 0;
+
+    finishing = 1;
+    finishing = 0;
 
     // Get pages to write
     zns_get_mgmt_zone_slba_idx(n, cmd, &slba, &logical_zone_idx, &physical_zone_idx);
     NvmeZone *logical_zone  = &n->zvtable->entries[logical_zone_idx].logical_zone;
     uint64_t pages_to_write = n->zone_capacity - (logical_zone->w_ptr - logical_zone->d.zslba);
+
+    pages_to_write = pages_to_write > FINISH_BLOCK_SIZE ? FINISH_BLOCK_SIZE : pages_to_write;
+
     // Nothing to write, but there is some RTT latency account for that
     if (!pages_to_write || pages_to_write == n->zone_capacity) {
         slba = logical_zone->w_ptr;
@@ -1559,29 +1674,32 @@ static uint64_t zns_advance_status_finish(ZNS *zns, NvmeRequest *req){
 
     // Direct blocking
 
-
     // Chunk based
     slba = logical_zone->w_ptr;
-    for (uint64_t i = 0; i < pages_to_write ; i += (ZNS_INTERNAL_PAGE_SIZE / 512)) {
+    uint64_t step_size = (ZNS_INTERNAL_PAGE_SIZE / 512);
+    for (uint64_t i = 0; i < pages_to_write ; i += step_size) {
         my_chnl_idx=zns_get_chnl_idx(ns, slba); 
+        my_plane_idx = zns_get_plane_idx(ns, slba); 
         chnl = &(zns->ch[my_chnl_idx]);
-        chnl_stime = (chnl->next_ch_avail_time < cmd_stime) ? cmd_stime : chnl->next_ch_avail_time;
+        plane= &(zns->planes[my_plane_idx]);
+
+        chnl_stime = (chnl->next_ch_avail_time < cmd_stime) ? \
+            cmd_stime : chnl->next_ch_avail_time;
         chnl->next_ch_avail_time = chnl_stime + spp->ch_xfer_lat;
 
-        my_plane_idx = zns_get_plane_idx(ns, slba); 
-        plane= &(zns->planes[my_plane_idx]);
         nand_stime = (plane->next_avail_time < chnl->next_ch_avail_time) ? chnl->next_ch_avail_time : \
             plane->next_avail_time;
         plane->next_avail_time = nand_stime + spp->pg_wr_lat;
-        lat = plane->next_avail_time - cmd_stime;
 
+        lat = plane->next_avail_time - cmd_stime;
         maxlat = (maxlat < lat) ? lat : maxlat;
+        slba += step_size;
     }
 
     return maxlat;
 }
 
-static int zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req){
+static uint64_t zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req){
     
     NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
     uint8_t opcode = rw->opcode;
@@ -1589,7 +1707,7 @@ static int zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, Nvme
 
     uint8_t action;
     action = dw13 & 0xff;
-    int out = 0;
+    uint64_t out = 0;
 
     // Zone Reset 
     if (action == NVME_ZONE_ACTION_RESET){
@@ -1609,7 +1727,9 @@ static int zns_advance_status(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, Nvme
         out = zns_advance_status_write(n->zns, req);
     }
     else { 
+        // femu_err("Going to read %u\n", finishing);
         out = zns_advance_status_read(n->zns, req);
+        // femu_err("Read %u\n", finishing);
     }
     return out;
 }
@@ -1623,6 +1743,7 @@ static uint16_t zns_io_read(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     uint64_t data_size = zns_l2b(ns, nlb);
     uint64_t data_offset;
     uint16_t status;
+    zns_vtable_entry* ventry;
 // #if PCIe_TIME_SIMULATION
 //     uint64_t nk = nlb/2;
 //     uint64_t delta_time = (uint64_t)nk*pow(10,9);   //n KB > 4096*1KB*2^10:10^9ns = 1KB : (10^9 / 2^10 / 4096)ns
@@ -1632,6 +1753,8 @@ static uint16_t zns_io_read(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
 // #endif
     assert(n->zoned);
     req->is_write = false;
+
+    ventry = zns_get_vtable_entry_by_slba(ns, slba);
 
     status = nvme_check_mdts(n, data_size);
     if (status) {
@@ -1665,9 +1788,12 @@ static uint16_t zns_io_read(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
             goto err;
         }
     }
-    // femu_err("read success?? slba %lu\n",slba);
+    // femu_err("read success?? slba %lu %d\n",slba, ventry->status);
     data_offset = zns_l2b(ns, slba);
-    req->expire_time += zns_advance_status(n,ns,cmd,req);
+    // For now treat read to an inactive zone as a noop
+    if (ventry->status == NVME_VZONE_ACTIVE) {
+        req->expire_time += zns_advance_status(n,ns,cmd,req);
+    }
     /*PCI latency model here*/
 
 //         lag=0;
@@ -1700,6 +1826,7 @@ err:
 static uint16_t zns_io_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
                           NvmeRequest *req)
 {
+    struct zns *zns = n->zns;
     NvmeRwCmd *rw = (NvmeRwCmd *)cmd;
     uint64_t slba = le64_to_cpu(rw->slba);
     uint32_t nlb = (uint32_t)le16_to_cpu(rw->nlb) + 1;
@@ -1711,10 +1838,17 @@ static uint16_t zns_io_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     uint16_t status;
     uint64_t zidx = zns_get_logical_zone_idx(ns, slba);
     uint64_t err_zidx = 0;
+    uint64_t reqtime = 0, tmpreqtime = 0;
 
     assert(n->zoned);
     req->is_write = true;
     //femu_err("PROFILING zns_write %lu\n", (req->expire_time -req->stime));
+
+    ventry = zns_get_vtable_entry_by_slba(ns, slba);
+    logical_zone = &ventry->logical_zone;
+    // Assign new zone?
+    zns_assign_physical_zone(n, ventry);
+
     status = nvme_check_mdts(n, data_size);
     if (status) {
         goto err;
@@ -1725,8 +1859,6 @@ static uint16_t zns_io_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         femu_err("zns check bounds [pid %x] slba : %lx , nlb : %x\n", getpid(), slba, nlb);
         goto err;
     }
-    ventry = zns_get_vtable_entry_by_slba(ns, slba);
-    logical_zone = &ventry->logical_zone;
 
     //lock
     //pthread_spin_lock(&zone->w_ptr_lock);
@@ -1744,16 +1876,32 @@ static uint16_t zns_io_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     if (status) {
         goto err;
     }
-    //lock
-    res->slba = zns_advance_zone_wp(ns, ventry, nlb);
-    //unlock
+    // Erase invalidated zone..
+    ZNSParams *spp = &zns->sp; 
+    bool reset = false;
+    if (spp->vtable_mode == 1 && ventry->status == NVME_VZONE_INVALID) {
+        femu_err("Resetting physical zone first %lu\n", zidx);
+        reqtime = zns_advance_status_reset_physical(req, zns, ventry->physical_zone);
+        ventry->physical_zone->w_ptr = ventry->physical_zone->d.zslba;
+        ventry->status = NVME_VZONE_ACTIVE;
+        reset = true;
+    }
+
     data_offset = zns_l2b(ns, slba);
     status = zns_map_dptr(n, data_size, req); // dptr:data pointer
     if (status) {
         goto err;
     }
-    req->expire_time += zns_advance_status(n,ns,cmd,req);
+    tmpreqtime = zns_advance_status(n,ns,cmd,req);
+    if (reset) {
+        femu_err("Resetting physical zone time %lu %lu %lu\n", reqtime, tmpreqtime, tmpreqtime > reqtime ? tmpreqtime : reqtime);
+    }
+    reqtime = tmpreqtime > reqtime ? tmpreqtime : reqtime;
+    req->expire_time += reqtime;
     backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
+    //lock
+    res->slba = zns_advance_zone_wp(ns, ventry, nlb);
+    //unlock
     zns_finalize_zoned_write(ns, req, false);
     //pthread_spin_unlock(&zone->w_ptr_lock);
 
@@ -1851,6 +1999,46 @@ static void zns_init(FemuCtrl *n, Error **errp)
     znsssd_init(n);
 }
 
+static void zns_init_vtable(FemuCtrl * n, ZNSParams *spp) {
+    NvmeZone *zone = n->zone_array;
+    uint64_t start = 0, zone_size = n->zone_size;  
+    uint64_t capacity = n->num_zones * zone_size;
+    struct zns_vtable_entry *ventry = n->zvtable->entries;
+    uint32_t i;
+
+    // Direct
+    if (spp->vtable_mode == 0) {
+        for (i = 0; i < n->num_zones; i++, zone++, ventry++) {
+            // All zone are active and will remain active
+            QTAILQ_INSERT_HEAD(&n->zvtable->active_zones, zone, entry);
+
+            if (start + zone_size > capacity) {
+                zone_size = capacity - start;
+            }
+
+            zns_set_physical_zone(&n->namespaces[0], ventry, zone);
+            ventry->status = NVME_VZONE_ACTIVE;
+
+            start += zone_size;
+        }
+    }
+    // Lazy
+    else {
+        for (i = 0; i < n->num_zones; i++, zone++, ventry++) {
+            // All physical zone start out as INACTIVE
+            QTAILQ_INSERT_HEAD(&n->zvtable->free_zones, zone, entry);
+            if (start + zone_size > capacity) {
+                zone_size = capacity - start;
+            }
+
+            zns_set_physical_zone(&n->namespaces[0], ventry, NULL);
+            ventry->status = NVME_VZONE_UNASSIGNED;
+
+            start += zone_size;
+        }
+    }
+}
+
 static void znsssd_init_params(FemuCtrl * n, ZNSParams *spp){
     ZNSParams *spp_param = &(n->zns_params); 
     NvmeNamespace *ns = &n->namespaces[0];
@@ -1858,6 +2046,7 @@ static void znsssd_init_params(FemuCtrl * n, ZNSParams *spp){
 
     spp->allow_partial_zone_resets = spp_param->allow_partial_zone_resets;
     spp->asynchronous_resets = spp_param->asynchronous_resets;
+    spp->vtable_mode = spp_param->vtable_mode;
 
     spp->pg_rd_lat = spp_param->pg_rd_lat;
     spp->pg_wr_lat = spp_param->pg_wr_lat;
@@ -1889,6 +2078,7 @@ static void znsssd_init_params(FemuCtrl * n, ZNSParams *spp){
         / spp->nchnls / spp->ways;
     spp->nchips         = (((int64_t)n->memsz) * 1024 * 1024) 
         / ZNS_EXTERNAL_PAGE_SIZE / spp->csze_pages;
+        
     femu_log("===========================================\n");
     femu_log("|        ConfZNS HW Configuration()       |\n");      
     femu_log("===========================================\n");
@@ -1897,11 +2087,13 @@ static void znsssd_init_params(FemuCtrl * n, ZNSParams *spp){
     femu_log("===========================================\n");
     femu_log("| nchnl       : %lu   | nway      : %lu   |\n", spp->nchnls, spp->ways);
     femu_log("| nchnl/zone  : %lu   | nway/zone : %lu   |\n", spp->chnls_per_zone, spp->ways_per_zone);
-    femu_log("| die/chip    : %lu   |           :       |\n", spp->dies_per_chip);
+    femu_log("| die/chip    : %lu   | io_qs     : %u    |\n", spp->dies_per_chip, n->num_io_queues);
     femu_log("| plane/die   : %lu   | block/die : %lu  |\n", spp->planes_per_die, spp->blocks_per_die);
     femu_log("| pages/block : %lu   |  stripe   : %lu   |\n", spp->block_size, zns_stripe_size_bs / ZNS_INTERNAL_PAGE_SIZE);
     femu_log("| page        : %ldKiB|  zones    : %lu  |\n", (ZNS_INTERNAL_PAGE_SIZE/KiB), spp->zones);
     femu_log("===========================================\n");
+
+    zns_init_vtable(n, spp);    
 }
 
 /**

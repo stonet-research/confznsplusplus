@@ -8,7 +8,8 @@
 #define ZNS_ZASL_SIZE_BYTES (1 * MiB)
 #define ZNS_ZONE_SIZE_BYTES (2 * GiB)
 #define ZNS_ZONE_SIZE_PAGES (ZNS_ZONE_SIZE_BYTES / ZNS_INTERNAL_PAGE_SIZE)
-#define FINISH_BLOCK_SIZE ((ZNS_INTERNAL_PAGE_SIZE / 512ULL) * 64ULL)
+//#define FINISH_BLOCK_SIZE ((ZNS_INTERNAL_PAGE_SIZE / 512ULL) * 64ULL)
+#define FINISH_BLOCK_SIZE ((ZNS_INTERNAL_PAGE_SIZE / 512ULL) * 1ULL)
 uint64_t lag = 0;
 uint64_t finishing = 0;
 
@@ -1072,15 +1073,17 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
         req->expire_time += zns_advance_status(n, ns, cmd, req);
         // femu_err("Finishing a zone at %u  %lu %lu / %lu\n", logical_zone_idx, zone->w_ptr, 
         //     zone->d.zslba, zns_zone_wr_boundary(zone));
-        if (logical_zone->w_ptr + FINISH_BLOCK_SIZE >= zns_zone_wr_boundary(physical_zone) || 
+        if (logical_zone->w_ptr + FINISH_BLOCK_SIZE >= zns_zone_wr_boundary(logical_zone) || 
             logical_zone->w_ptr == logical_zone->d.zslba) {
-            // femu_err("Done finished\n");
+            femu_err("Done finished\n");
             status = zns_do_zone_op(ns, logical_zone, proc_mask, zns_finish_zone, req);
             zns_set_zone_state(physical_zone, logical_zone->d.zs);
             cmd->cdw13 =  cpu_to_le32(le32_to_cpu(cmd->cdw13) | 0x100);
+                    femu_err("Done finished?\n");
         } else {
             logical_zone->w_ptr += FINISH_BLOCK_SIZE;
-            // femu_err("zone->wptr %lu %lu\n", zone->w_ptr, FINISH_BLOCK_SIZE);
+            physical_zone->w_ptr += FINISH_BLOCK_SIZE;
+            femu_err("zone->wptr %lu %lu %lu\n", logical_zone->w_ptr, physical_zone->w_ptr, FINISH_BLOCK_SIZE);
         }
         // femu_err("zone finish action:%c slba:%ld zone_idx:%d req->expire_time(%lu) - req->stime(%lu):%lu\n",
         //    action, req->slba ,logical_zone_idx,req->expire_time,req->stime,(req->expire_time - req->stime));
@@ -1100,7 +1103,8 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
             req->expire_time += zns_advance_status(n, ns, cmd, req);
             status = zns_do_zone_op(ns, logical_zone, proc_mask, zns_reset_zone, req);
             zns_set_zone_state(physical_zone, logical_zone->d.zs);
-            physical_zone->w_ptr = physical_zone->d.zslba;
+            logical_zone->w_ptr = physical_zone->w_ptr = physical_zone->d.zslba;
+            // femu_err("Reset %lu to %lu\n", logical_zone_idx, logical_zone->w_ptr);
             n->zvtable->entries[logical_zone_idx].physical_zone->cnt_reset += 1;
         } else {
             femu_err("Erasing zone %lu\n", logical_zone_idx);
@@ -1548,7 +1552,7 @@ static uint64_t zns_advance_status_write(ZNS *zns, NvmeRequest *req){
     pthread_spin_unlock(&(chnl->time_lock));
 
     if (zone->w_ptr - zone->d.zslba < 1024) {
-        femu_err("Write lat %lu %lu\n", zone->w_ptr, maxlat);
+        // femu_err("Write lat %lu %lu\n", zone->w_ptr, maxlat);
     }
 
     // femu_err("Write lat %lu %lu\n", slba, maxlat);

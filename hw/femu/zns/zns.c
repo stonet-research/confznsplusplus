@@ -3,13 +3,13 @@
 #include <signal.h>
 
 #define ZNS_EXTERNAL_PAGE_SIZE (4 * KiB)  // Exposed through NVMe
-#define ZNS_INTERNAL_PAGE_SIZE (8 * KiB) // Internal mapped size, the flash page size
+#define ZNS_INTERNAL_PAGE_SIZE (16 * KiB) // Internal mapped size, the flash page size
 #define ZNS_PAGE_PARALLELISM (ZNS_INTERNAL_PAGE_SIZE / ZNS_EXTERNAL_PAGE_SIZE) // How much parallel I/O fits in one flash page
 #define ZNS_ZASL_SIZE_BYTES (1 * MiB)
 #define ZNS_ZONE_SIZE_BYTES (2 * GiB)
 #define ZNS_ZONE_SIZE_PAGES (ZNS_ZONE_SIZE_BYTES / ZNS_INTERNAL_PAGE_SIZE)
 //#define FINISH_BLOCK_SIZE ((ZNS_INTERNAL_PAGE_SIZE / 512ULL) * 64ULL)
-#define FINISH_BLOCK_SIZE ((ZNS_INTERNAL_PAGE_SIZE / 512ULL) * 1ULL)
+#define FINISH_BLOCK_SIZE ((ZNS_INTERNAL_PAGE_SIZE / 512ULL) * 16ULL)
 uint64_t lag = 0;
 uint64_t finishing = 0;
 
@@ -35,7 +35,7 @@ static inline uint32_t zns_get_physical_zone_idx(NvmeNamespace *ns, uint64_t slb
         // femu_err("Get physical_idx when NULL\n");
         return 0;
     }
-    uint64_t trueslba = ns->ctrl->zvtable->entries[logical_zone_idx].physical_zone->w_ptr;
+    uint64_t trueslba = ns->ctrl->zvtable->entries[logical_zone_idx].physical_zone->d.zslba+1;
     return zns_get_logical_zone_idx(ns, trueslba);
 }
 
@@ -172,8 +172,12 @@ static inline void zns_assign_physical_zone(FemuCtrl *n, zns_vtable_entry* ventr
         // Then in used zones...
         else if (!QTAILQ_EMPTY(&n->zvtable->invalid_zones)) {
             femu_err("Found invalid zone \n");
-            physical_zone = QTAILQ_LAST(&n->zvtable->invalid_zones);
+            physical_zone = QTAILQ_FIRST(&n->zvtable->invalid_zones);
             zns_set_physical_zone(&n->namespaces[0], ventry, physical_zone);
+            // if (physical_zone == NULL) {
+            //     femu_err("Invalid zone is NULL?\n");
+            // }
+            // femu_err("Invalid zone starts at %lu %lu\n", physical_zone->d.zslba, physical_zone->w_ptr);
             ventry->physical_zone = physical_zone;   
             ventry->status = NVME_VZONE_INVALID;
             QTAILQ_REMOVE(&n->zvtable->invalid_zones, physical_zone, entry);
@@ -1111,13 +1115,15 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
             status = zns_do_zone_op(ns, logical_zone, proc_mask, zns_reset_zone, req);
             ventry = zns_get_vtable_entry_by_slba(ns, slba);
             // Mark as unused
-            if (physical_zone) {
+            if (physical_zone != NULL) {
                 if (QTAILQ_IN_USE(physical_zone, entry)) {
                     QTAILQ_REMOVE(&n->zvtable->active_zones, physical_zone, entry);
                 }
                 QTAILQ_INSERT_HEAD(&n->zvtable->invalid_zones, physical_zone, entry);
                 zns_set_physical_zone(&n->namespaces[0], ventry, NULL);
                 ventry->status = NVME_VZONE_UNASSIGNED;
+            } else {
+                femu_err("Erasing already empty zone %lu\n", logical_zone_idx);
             }
         }
 
@@ -1364,7 +1370,7 @@ static uint64_t zns_advance_status_reset_physical(NvmeRequest *req, ZNS *zns, Nv
                     plane->next_avail_time + spp->blk_er_lat : cmd_stime + spp->blk_er_lat;
             lat = plane->next_avail_time - cmd_stime;
             maxlat = (maxlat < lat) ? lat : maxlat;
-            femu_err("Erasure %lu %lu %lu --- %lu out of %lu\n", my_plane_idx, lat, maxlat, spp->blk_er_lat, blocks_to_erase);
+            // femu_err("Erasure %lu %lu %lu --- %lu out of %lu\n", my_plane_idx, lat, maxlat, spp->blk_er_lat, blocks_to_erase);
         }
     }
     return maxlat;
